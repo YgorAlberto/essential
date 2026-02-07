@@ -200,6 +200,8 @@ sudo rm /usr/local/bin/myip.sh
 sudo rm /usr/local/bin/normal_validator.sh
 sudo rm /usr/local/bin/selenium_validator.py
 sudo rm /usr/local/bin/update.sh
+cd ..
+rm -rf essential
 
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
