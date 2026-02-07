@@ -195,6 +195,12 @@ fi
 chmod +x *
 rm dependencias.sh
 sudo mv * /usr/local/bin
+sudo rm /usr/local/bin/bird*
+sudo rm /usr/local/bin/myip.sh
+sudo rm /usr/local/bin/normal_validator.sh
+sudo rm /usr/local/bin/selenium_validator.py
+sudo rm /usr/local/bin/update.sh
+
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║${NC}              ${GREEN}INSTALAÇÃO CONCLUÍDA!${NC}                         ${CYAN}║${NC}"
