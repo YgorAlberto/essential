@@ -193,11 +193,7 @@ fi
 # Finalização
 #===============================================================================
 chmod +x *
-sudo rm /usr/local/bin/bird*
-sudo rm /usr/local/bin/myip.sh
-sudo rm /usr/local/bin/normal_validator.sh
-sudo rm /usr/local/bin/selenium_validator.py
-sudo rm /usr/local/bin/update.sh
+sudo rm /usr/local/bin/bird* && sudo rm /usr/local/bin/myip.sh && sudo rm /usr/local/bin/normal_validator.sh && sudo rm /usr/local/bin/selenium_validator.py && sudo rm /usr/local/bin/update.sh
 rm dependencias.sh
 sudo mv * /usr/local/bin
 cd ..
