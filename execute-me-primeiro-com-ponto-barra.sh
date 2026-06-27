@@ -114,7 +114,7 @@ echo ""
 echo "📦 Baixando modelo qwen2.5:7b..."
 ollama pull qwen2.5:7b
 echo ""
-echo "✅ Ollama + qwen2.5:7b instalados com sucesso
+echo "✅ Ollama + qwen2.5:7b instalados com sucesso"
 
 #===============================================================================
 # Instalar GeckoDriver (Firefox)
@@ -207,8 +207,8 @@ fi
 # Finalização
 #===============================================================================
 chmod +x *
-sudo rm /usr/local/bin/bird* && sudo rm /usr/local/bin/myip.sh && sudo rm /usr/local/bin/normal_validator.sh && sudo rm /usr/local/bin/selenium_validator.py && sudo rm /usr/local/bin/update.sh
-rm dependencias.sh
+sudo rm /usr/local/bin/bird* 
+rm execute-me-primeiro-com-ponto-barra.sh
 sudo mv * /usr/local/bin
 cd ..
 rm -rf essential
