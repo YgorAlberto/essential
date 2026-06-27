@@ -207,11 +207,7 @@ fi
 # Finalização
 #===============================================================================
 chmod +x *
-sudo rm /usr/local/bin/bird* 
-rm execute-me-primeiro-com-ponto-barra.sh
-sudo mv * /usr/local/bin
-cd ..
-rm -rf essential
+sudo rm /usr/local/bin/bird* && rm execute-me-primeiro-com-ponto-barra.sh && sudo mv * /usr/local/bin && cd .. && rm -rf essential
 
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
