@@ -105,16 +105,85 @@ echo -e "${GREEN}[✓]${NC} Pacotes instalados: selenium, webdriver-manager, Pil
 # ============================================
 # LLM / AI Dashboard - Ollama + Modelo
 # ============================================
+OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:7b}"
+OLLAMA_START_LOG="${TMPDIR:-/tmp}/ollama-serve.log"
+
+ollama_is_ready() {
+    ollama list >/dev/null 2>&1
+}
+
+wait_for_ollama() {
+    local attempt
+    for ((attempt = 1; attempt <= 60; attempt++)); do
+        if ollama_is_ready; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "🤖 Instalando Ollama (LLM para Dashboard IA)"
+echo "🤖 Configurando Ollama (LLM para Dashboard IA)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-curl -fsSL https://ollama.ai/install.sh | sh
+
+if command -v ollama >/dev/null 2>&1; then
+    echo "✅ Ollama já está instalado: $(ollama --version 2>/dev/null || echo 'versão não identificada')"
+else
+    echo "📦 Ollama não encontrado. Instalando..."
+    curl -fsSL https://ollama.com/install.sh | sh
+    hash -r
+
+    if ! command -v ollama >/dev/null 2>&1; then
+        echo -e "${RED}[ERRO]${NC} A instalação terminou, mas o comando ollama não foi encontrado."
+        exit 1
+    fi
+fi
+
+if ollama_is_ready; then
+    echo "✅ Servidor Ollama já está respondendo."
+else
+    echo "⏳ Iniciando o servidor Ollama..."
+    OLLAMA_SYSTEMD_STARTED=0
+
+    if command -v systemctl >/dev/null 2>&1 && \
+       systemctl list-unit-files ollama.service >/dev/null 2>&1; then
+        if sudo systemctl enable --now ollama; then
+            OLLAMA_SYSTEMD_STARTED=1
+        else
+            echo -e "${YELLOW}[!]${NC} Não foi possível iniciar o serviço systemd do Ollama."
+        fi
+    fi
+
+    if [ "$OLLAMA_SYSTEMD_STARTED" -eq 0 ]; then
+        echo "ℹ️  Iniciando 'ollama serve' em segundo plano (log: $OLLAMA_START_LOG)..."
+        nohup ollama serve >"$OLLAMA_START_LOG" 2>&1 &
+    fi
+
+    echo "⏳ Aguardando o Ollama ficar disponível (até 60 segundos)..."
+    if ! wait_for_ollama; then
+        echo -e "${RED}[ERRO]${NC} O servidor Ollama não respondeu após 60 segundos."
+        if [ "$OLLAMA_SYSTEMD_STARTED" -eq 1 ]; then
+            echo "Consulte o diagnóstico com: sudo journalctl -u ollama -n 50 --no-pager"
+        else
+            echo "Consulte o log em: $OLLAMA_START_LOG"
+        fi
+        exit 1
+    fi
+    echo "✅ Servidor Ollama pronto."
+fi
+
 echo ""
-echo "📦 Baixando modelo qwen2.5:7b..."
-ollama pull qwen2.5:7b
+if ollama show "$OLLAMA_MODEL" >/dev/null 2>&1; then
+    echo "✅ Modelo $OLLAMA_MODEL já está instalado."
+else
+    echo "📦 Baixando modelo $OLLAMA_MODEL..."
+    ollama pull "$OLLAMA_MODEL"
+fi
+
 echo ""
-echo "✅ Ollama + qwen2.5:7b instalados com sucesso"
+echo "✅ Ollama + $OLLAMA_MODEL disponíveis com sucesso"
 
 #===============================================================================
 # Instalar GeckoDriver (Firefox)
