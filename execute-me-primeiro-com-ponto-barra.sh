@@ -275,19 +275,133 @@ fi
 #===============================================================================
 # Finalização
 #===============================================================================
-chmod +x *
-sudo rm /usr/local/bin/bird* && rm execute-me-primeiro-com-ponto-barra.sh && sudo mv * /usr/local/bin && cd .. && rm -rf essential
+echo -e "\n${GREEN}[FINAL]${NC} Publicando as ferramentas em /usr/local/bin..."
+
+# A finalização possui seu próprio controle de erros. Desabilitar o `set -e`
+# aqui garante que uma etapa com falha não impeça a execução das seguintes.
+set +e
+FINALIZATION_ERRORS=0
+SOURCE_DIR="$(pwd -P)"
+
+report_final_error() {
+    local description="$1"
+    local exit_code="$2"
+    FINALIZATION_ERRORS=$((FINALIZATION_ERRORS + 1))
+    echo -e "  ${RED}✗ ERRO${NC} — $description (código $exit_code)"
+}
+
+run_final_step() {
+    local description="$1"
+    shift
+
+    if "$@"; then
+        echo -e "  ${GREEN}✓ OK${NC} — $description"
+    else
+        local exit_code=$?
+        report_final_error "$description" "$exit_code"
+    fi
+
+    # A função sempre retorna sucesso para que o `set -e` não interrompa
+    # as demais etapas da finalização.
+    return 0
+}
+
+remove_previous_tools() {
+    local previous_tools
+    shopt -s nullglob
+    previous_tools=(
+        /usr/local/bin/bird*
+        /usr/local/bin/myip.sh
+        /usr/local/bin/normal_validator.sh
+        /usr/local/bin/selenium_validator.py
+        /usr/local/bin/update.sh
+    )
+    shopt -u nullglob
+
+    if [ "${#previous_tools[@]}" -eq 0 ]; then
+        return 0
+    fi
+    sudo rm -f -- "${previous_tools[@]}"
+}
+
+# Expande os padrões sem gerar erro quando algum arquivo legado não existir.
+shopt -s nullglob
+TOOL_CANDIDATES=(bird* myip.sh normal_validator.sh selenium_validator.py update.sh)
+shopt -u nullglob
+
+TOOLS_TO_INSTALL=()
+for tool in "${TOOL_CANDIDATES[@]}"; do
+    if [ -f "$tool" ]; then
+        TOOLS_TO_INSTALL+=("$tool")
+    fi
+done
+
+if [ "${#TOOLS_TO_INSTALL[@]}" -eq 0 ]; then
+    report_final_error "nenhuma ferramenta foi encontrada para instalação" 1
+else
+    for tool in "${TOOLS_TO_INSTALL[@]}"; do
+        run_final_step "permissão de execução em $tool" chmod +x -- "$tool"
+    done
+
+    run_final_step "remoção segura das versões anteriores" remove_previous_tools
+
+    # `install` copia cada arquivo individualmente e define a permissão final.
+    # Assim, uma falha não remove os fontes nem impede os próximos arquivos.
+    for tool in "${TOOLS_TO_INSTALL[@]}"; do
+        destination="/usr/local/bin/$(basename "$tool")"
+        run_final_step "instalação de $tool em $destination" \
+            sudo install -m 0755 -- "$tool" "$destination"
+    done
+fi
+
+if [ -e dependencias.sh ]; then
+    run_final_step "remoção do arquivo auxiliar dependencias.sh" rm -f -- dependencias.sh
+else
+    echo -e "  ${BLUE}ℹ INFO${NC} — dependencias.sh não existe; nada para remover"
+fi
+
+# Só apaga o diretório de origem quando todas as ferramentas foram publicadas.
+# Em caso de erro, os arquivos são preservados para correção ou nova tentativa.
+if [ "$FINALIZATION_ERRORS" -eq 0 ]; then
+    SOURCE_PARENT="$(dirname "$SOURCE_DIR")"
+    SOURCE_NAME="$(basename "$SOURCE_DIR")"
+
+    if [ "$SOURCE_NAME" = "essential" ] && [ "$SOURCE_DIR" != "/" ]; then
+        if cd "$SOURCE_PARENT"; then
+            if rm -rf -- "$SOURCE_DIR"; then
+                echo -e "  ${GREEN}✓ OK${NC} — diretório de origem removido: $SOURCE_DIR"
+            else
+                report_final_error "não foi possível remover $SOURCE_DIR" "$?"
+            fi
+        else
+            report_final_error "não foi possível acessar $SOURCE_PARENT" "$?"
+        fi
+    else
+        echo -e "  ${YELLOW}! AVISO${NC} — diretório de origem preservado por segurança: $SOURCE_DIR"
+    fi
+else
+    echo -e "  ${YELLOW}! AVISO${NC} — diretório de origem preservado devido aos erros: $SOURCE_DIR"
+fi
 
 echo ""
-echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║${NC}          ${GREEN}INSTALAÇÃO CONCLUÍDA!${NC}                               ${CYAN}║${NC}"
-echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+if [ "$FINALIZATION_ERRORS" -eq 0 ]; then
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}          ${GREEN}INSTALAÇÃO CONCLUÍDA SEM ERROS!${NC}                     ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${CYAN}╔════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}          ${GREEN}DIGITE 'BIRD' E DÊ TAB PARA RODAR AS FERRAMENTAS${NC}                              ${CYAN}║${NC}"
+    echo -e "${CYAN}╚════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+else
+    echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║${NC}  FINALIZAÇÃO CONCLUÍDA COM ${RED}${FINALIZATION_ERRORS} ERRO(S)${NC}; veja os detalhes acima.  ${YELLOW}║${NC}"
+    echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${YELLOW}[!] Corrija os erros informados e execute novamente o instalador.${NC}"
+fi
 echo ""
-echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║${NC}          ${GREEN}ARQUIVO MOVIDOS PARA BIN!                         ${NC}  ${CYAN}║${NC}"
-echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-echo ""
-echo -e "${CYAN}╔════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║${NC}          ${GREEN}DIGITE 'BIRD' E DÊ TAB PARA RODAR AS FERRAMENTAS${NC}                              ${CYAN}║${NC}"
-echo -e "${CYAN}╚════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
-echo ""
+
+# Depois de executar e relatar todas as etapas, sinalize a falha também para
+# automações/CI sem esconder o resultado parcial da instalação.
+if [ "$FINALIZATION_ERRORS" -gt 0 ]; then
+    exit 1
+fi
