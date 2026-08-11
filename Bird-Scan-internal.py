@@ -6,8 +6,11 @@ Single-file tool for authorized internal network enumeration on Kali Linux.
 
 The default behavior is intentionally conservative: it maps hosts/services,
 catalogs web endpoints, runs safe enumeration helpers, and writes a consultive
-HTML report plus machine-readable exports. It does not brute-force, spray
-passwords, or exploit services.
+HTML report plus machine-readable exports. It does not brute-force or exploit
+services by default. When username/password lists are supplied, authorized
+credential attempts run across auth-capable services using configurable modes
+(pitchfork, clusterbomb, single-user, single-pass) while still attempting
+anonymous/null access first.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import concurrent.futures
 import csv
 import datetime as dt
 import ftplib
+import glob
 import hashlib
 import html
 import ipaddress
@@ -25,7 +29,6 @@ import os
 import re
 import shutil
 import socket
-import ssl
 import subprocess
 import sys
 import tempfile
@@ -96,6 +99,13 @@ FUZZ_DASHBOARD_TOOLS = ("Gobuster", "Feroxbuster", "Dirsearch")
 WEB_MAX_BODY_BYTES = 1048576
 DIRSEARCH_MAX_RESULTS_PER_BASE = 200
 
+KERBRUTE_USER_WORDLIST_CANDIDATES = [
+    "/usr/share/seclists/Usernames/xato-net-10-million-usernames.txt",
+    "/usr/share/seclists/Usernames/Names/names.txt",
+    "/usr/share/seclists/Kerberos/A-ZSurnames.txt",
+    "/usr/share/seclists/Usernames/top-usernames-shortlist.txt",
+]
+
 DEPENDENCIES = [
     "nmap",
     "curl",
@@ -103,6 +113,10 @@ DEPENDENCIES = [
     "crackmapexec",
     "smbclient",
     "rpcclient",
+    "mysql",
+    "psql",
+    "redis-cli",
+    "mongosh",
     "host",
     "gowitness",
     "gobuster",
@@ -122,6 +136,7 @@ DEPENDENCIES = [
     "snmpwalk",
     "swaks",
     "vncviewer",
+    "kerbrute",
 ]
 
 DEPENDENCY_PACKAGES = {
@@ -131,6 +146,10 @@ DEPENDENCY_PACKAGES = {
     "crackmapexec": "crackmapexec",
     "smbclient": "smbclient",
     "rpcclient": "samba-common-bin",
+    "mysql": "default-mysql-client",
+    "psql": "postgresql-client",
+    "redis-cli": "redis-tools",
+    "mongosh": "mongosh",
     "host": "bind9-host",
     "gowitness": "gowitness",
     "gobuster": "gobuster",
@@ -150,6 +169,7 @@ DEPENDENCY_PACKAGES = {
     "snmpwalk": "snmp",
     "swaks": "swaks",
     "vncviewer": "tigervnc-viewer",
+    "kerbrute": "kerbrute",
 }
 
 SMB_PORTS = {139, 445}
@@ -268,6 +288,8 @@ class WebEndpoint:
     raw_headers_file: str = ""
     body_sample_file: str = ""
     screenshot_file: str = ""
+    favicon_url: str = ""
+    favicon_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -343,6 +365,7 @@ class ScanState:
         existing = self.find_service(service.ip, service.port, service.protocol)
         if existing:
             merge_service(existing, service)
+            self.upsert_host(service.ip, sources=[service.source or "service"])
             return
         self.services.append(service)
         self.upsert_host(service.ip, sources=[service.source or "service"])
@@ -401,9 +424,51 @@ def ensure_list(value: Any) -> list[Any]:
 
 
 def merge_service(existing: ServiceRecord, incoming: ServiceRecord) -> None:
-    for field_name in ("service", "product", "version", "banner", "state", "source"):
-        if not getattr(existing, field_name) and getattr(incoming, field_name):
-            setattr(existing, field_name, getattr(incoming, field_name))
+    existing.service = richer_service_name(existing.service, incoming.service, existing.port)
+    for field_name in ("product", "version", "banner"):
+        setattr(existing, field_name, richer_text_value(getattr(existing, field_name), getattr(incoming, field_name)))
+    if incoming.state == "open" and existing.state != "open":
+        existing.state = incoming.state
+    existing.source = merge_source_text(existing.source, incoming.source)
+
+
+def richer_service_name(current: str, incoming: str, port: int) -> str:
+    current = (current or "").strip()
+    incoming = (incoming or "").strip()
+    if not incoming:
+        return current
+    if not current:
+        return incoming
+    if is_unknown_service_name(incoming):
+        return current
+    if is_unknown_service_name(current):
+        return incoming
+    guessed = guess_service_by_port(port).lower()
+    if guessed and current.lower() == guessed and incoming.lower() != current.lower():
+        return incoming
+    return current
+
+
+def is_unknown_service_name(value: str) -> bool:
+    normalized = (value or "").strip().lower()
+    return not normalized or normalized in {"unknown", "?", "tcpwrapped"}
+
+
+def richer_text_value(current: str, incoming: str) -> str:
+    current = (current or "").strip()
+    incoming = (incoming or "").strip()
+    if not incoming:
+        return current
+    if not current or current.lower() in {"unknown", "?"}:
+        return incoming
+    if len(incoming) > len(current) and current.lower() in incoming.lower():
+        return incoming
+    return current
+
+
+def merge_source_text(current: str, incoming: str) -> str:
+    values = dedupe_text(part.strip() for part in re.split(r",\s*", f"{current},{incoming}") if part.strip())
+    return ", ".join(values)
 
 
 def add_host_alias(record: HostRecord, alias: str) -> None:
@@ -439,7 +504,7 @@ def relpath(path: Path | str, base: Path | str) -> str:
 def redact_command(command: list[str], secrets: Iterable[str] = ()) -> list[str]:
     secret_set = {secret for secret in secrets if secret}
     redacted: list[str] = []
-    skip_next_for = {"-p", "--password", "--pw"}
+    skip_next_for = {"--password", "--pw", "--hash", "--hashes", "-hashes"}
     previous = ""
     for part in command:
         if previous in skip_next_for:
@@ -484,6 +549,7 @@ def run_command(
     logger: Logger | None = None,
     secrets: Iterable[str] = (),
     input_text: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> CommandResult:
     redacted = redact_command(command, secrets=secrets)
     start = time.monotonic()
@@ -499,6 +565,7 @@ def run_command(
             errors="replace",
             timeout=timeout,
             check=False,
+            env=env,
         )
         stdout = proc.stdout or ""
         stderr = proc.stderr or ""
@@ -558,6 +625,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
               python3 Bird-Scan-internal.py --target 192.168.1.0/24 --profile safe
               python3 Bird-Scan-internal.py --targets-file targets.txt --threads-level 3
               python3 Bird-Scan-internal.py --from-nmap scan.xml --skip-nmap
+              python3 Bird-Scan-internal.py --from-nmap scan1.nmap scan2.xml --skip-nmap
+              python3 Bird-Scan-internal.py --from-nmap 'scans/nmap*' --skip-nmap
               python3 Bird-Scan-internal.py --from-nmap scans/internal-full --output-dir outputs
               python3 Bird-Scan-internal.py --from-ip-port found.txt --web-only
               python3 Bird-Scan-internal.py --target 10.10.10.0/24 --ports 80,443,445
@@ -574,7 +643,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     target_group = parser.add_argument_group("targets")
     target_group.add_argument("--target", "-t", action="append", help="IP, CIDR, hostname, or comma-separated list.")
     target_group.add_argument("--targets-file", help="File with IPs, CIDRs, hostnames, or comma-separated values.")
-    target_group.add_argument("--from-nmap", action="append", help="Import Nmap XML, normal, or gnmap output.")
+    target_group.add_argument("--from-nmap", action="append", nargs="+", help="Import one or more Nmap XML, normal, gnmap outputs, directories, prefixes, or glob patterns.")
     target_group.add_argument("--from-ip-port", action="append", help="Import simple IP:PORT or host:port file.")
 
     scan_group = parser.add_argument_group("scan behavior")
@@ -612,6 +681,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     auth_group.add_argument("--username", "-u", help="Single username for authenticated enumeration.")
     auth_group.add_argument("--password", "-p", help="Single password for authenticated enumeration.")
     auth_group.add_argument("--ntlm-hash", help="Single NTLM hash for authenticated enumeration.")
+    auth_group.add_argument("--username-file", help="Username list for authenticated enumeration across auth-capable services.")
+    auth_group.add_argument("--password-file", help="Password list for authenticated enumeration across auth-capable services.")
+    auth_group.add_argument(
+        "--auth-attack-mode",
+        choices=["auto", "pitchfork", "clusterbomb", "single-user", "single-pass"],
+        default="pitchfork",
+        help=(
+            "Credential combination strategy when lists are used: "
+            "pitchfork (user1/pass1, user2/pass2), clusterbomb (all user x pass pairs), "
+            "single-user (one user with a password list), single-pass (user list with one password). "
+            "auto picks based on supplied arguments. Default: pitchfork."
+        ),
+    )
     auth_group.add_argument("--domain", "-d", help="Domain for authenticated enumeration.")
     auth_group.add_argument("--kerberos", "-k", action="store_true", help="Use Kerberos mode when supported by a tool.")
 
@@ -644,6 +726,20 @@ def has_cli_input(args: argparse.Namespace) -> bool:
     )
 
 
+def flatten_cli_values(values: Any) -> list[str]:
+    flattened: list[str] = []
+    for value in ensure_list(values or []):
+        if isinstance(value, (list, tuple, set)):
+            flattened.extend(flatten_cli_values(value))
+        elif value:
+            flattened.append(str(value))
+    return flattened
+
+
+def nmap_import_values(args: argparse.Namespace) -> list[str]:
+    return flatten_cli_values(args.from_nmap)
+
+
 def validate_required_cli_input(args: argparse.Namespace) -> None:
     if has_cli_input(args):
         return
@@ -656,7 +752,7 @@ def validate_required_cli_input(args: argparse.Namespace) -> None:
 def validate_cli_file_paths(args: argparse.Namespace) -> None:
     if args.targets_file and not Path(args.targets_file).is_file():
         raise BirdScanUsageError(f"Arquivo de alvos inválido ou inexistente: {args.targets_file}")
-    for nmap_file in args.from_nmap or []:
+    for nmap_file in nmap_import_values(args):
         nmap_paths = resolve_nmap_import_paths(Path(nmap_file))
         if not nmap_paths:
             raise BirdScanUsageError(
@@ -681,15 +777,58 @@ def validate_cli_file_paths(args: argparse.Namespace) -> None:
         raise BirdScanUsageError(f"Wordlist web inválida ou inexistente: {args.web_wordlist}")
     if args.user_enum_wordlist and not Path(args.user_enum_wordlist).is_file():
         raise BirdScanUsageError(f"Wordlist de usuários inválida ou inexistente: {args.user_enum_wordlist}")
+    if getattr(args, "username_file", None) and not Path(args.username_file).is_file():
+        raise BirdScanUsageError(f"Lista de usuários inválida ou inexistente: {args.username_file}")
+    if getattr(args, "password_file", None) and not Path(args.password_file).is_file():
+        raise BirdScanUsageError(f"Lista de senhas inválida ou inexistente: {args.password_file}")
+    validate_credential_attack_args(args)
+
+
+def validate_credential_attack_args(args: argparse.Namespace) -> None:
+    mode = getattr(args, "auth_attack_mode", "pitchfork") or "pitchfork"
+    if mode in {"single-user", "single-pass"}:
+        users = collect_credential_usernames(args)
+        passwords = collect_credential_passwords(args)
+        if not users or not passwords:
+            raise BirdScanUsageError(
+                f"Modo {mode} exige ao menos um usuário e uma senha via -u/-p ou arquivos de lista."
+            )
+
+
+def warn_credential_list_size_mismatch(
+    args: argparse.Namespace,
+    mode: str,
+    users: list[str],
+    passwords: list[str],
+    logger: Logger,
+    state: ScanState | None = None,
+) -> None:
+    if mode != "pitchfork" or not users or not passwords:
+        return
+    if len(users) == len(passwords):
+        return
+    message = (
+        "Listas de usuários e senhas com tamanhos diferentes no modo pitchfork "
+        f"({len(users)} usuário(s) vs {len(passwords)} senha(s)); "
+        f"continuando com {min(len(users), len(passwords))} par(es) até a menor lista acabar."
+    )
+    logger.warn(message)
+    if state is not None:
+        state.metadata["credential_list_size_warning"] = message
 
 
 def file_has_nmap_markers(path: Path) -> bool:
-    sample = path.read_text(encoding="utf-8", errors="replace")[:262144]
+    try:
+        sample = path.read_text(encoding="utf-8", errors="replace")[:262144]
+    except OSError:
+        return False
     return (
         looks_like_xml(sample)
         or "Nmap scan report for" in sample
         or "Discovered open port" in sample
+        or ("Host:" in sample and ("Status:" in sample or "Ports:" in sample))
         or ("Ports:" in sample and re.search(r"/open(?:\||/)", sample) is not None)
+        or ("Starting Nmap" in sample and "Nmap done:" in sample)
     )
 
 
@@ -1038,19 +1177,21 @@ def guess_service_by_port(port: int) -> str:
 
 def resolve_nmap_import_paths(path: Path) -> list[Path]:
     candidates: list[Path] = []
-    if path.is_dir():
-        for pattern in ("*.xml", "*.gnmap", "*.nmap", "*"):
-            candidates.extend(sorted(item for item in path.glob(pattern) if item.is_file()))
-    else:
-        if not path.suffix:
-            candidates.extend(
-                [
-                    path.with_suffix(".xml"),
-                    path.with_suffix(".gnmap"),
-                    path.with_suffix(".nmap"),
-                ]
-            )
-        candidates.append(path)
+    inputs = expand_glob_paths(path) if path_has_glob(path) else [path]
+    for item_path in inputs:
+        if item_path.is_dir():
+            for pattern in ("*.xml", "*.gnmap", "*.nmap", "nmap*", "*"):
+                candidates.extend(sorted(item for item in item_path.glob(pattern) if item.is_file()))
+        else:
+            if not item_path.suffix:
+                candidates.extend(
+                    [
+                        item_path.with_suffix(".xml"),
+                        item_path.with_suffix(".gnmap"),
+                        item_path.with_suffix(".nmap"),
+                    ]
+                )
+            candidates.append(item_path)
 
     unique: list[Path] = []
     seen: set[Path] = set()
@@ -1058,10 +1199,22 @@ def resolve_nmap_import_paths(path: Path) -> list[Path]:
         resolved = candidate.resolve() if candidate.exists() else candidate
         if resolved in seen:
             continue
-        if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
+        try:
+            is_candidate = candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0
+        except OSError:
+            is_candidate = False
+        if is_candidate and file_has_nmap_markers(candidate):
             unique.append(candidate)
             seen.add(resolved)
     return unique
+
+
+def path_has_glob(path: Path) -> bool:
+    return any(char in str(path) for char in "*?[")
+
+
+def expand_glob_paths(path: Path) -> list[Path]:
+    return [Path(item) for item in sorted(glob.glob(str(path)))]
 
 
 def import_nmap_path(path: Path, state: ScanState, logger: Logger) -> None:
@@ -1085,9 +1238,8 @@ def import_nmap_path(path: Path, state: ScanState, logger: Logger) -> None:
         f"from {len(paths)} file(s)"
     )
     if imported_hosts == 0 and imported_services == 0:
-        raise BirdScanUsageError(
-            f"Nenhum host/serviço foi importado de {path}. "
-            "Confira se o arquivo é um output Nmap válido em XML/gnmap/normal, e não apenas um log de comando ou prefixo vazio."
+        logger.warn(
+            f"Nenhum host/serviço útil foi importado de {path}; mantendo a execução para aproveitar os demais arquivos Nmap."
         )
 
 
@@ -1120,7 +1272,7 @@ def parse_nmap_file(path: Path, state: ScanState, logger: Logger) -> None:
     if looks_like_xml(text):
         logger.info(f"Importing Nmap XML from {path}")
         parse_nmap_xml(text, state, source=path.name, raw_file=relpath(path, state.output_dir))
-    elif "Ports:" in text and re.search(r"/open(?:\||/)", text):
+    elif looks_like_gnmap(text):
         logger.info(f"Importing Nmap greppable data from {path}")
         parse_nmap_gnmap(text, state, source=path.name)
     else:
@@ -1131,6 +1283,13 @@ def parse_nmap_file(path: Path, state: ScanState, logger: Logger) -> None:
 def looks_like_xml(text: str) -> bool:
     sample = text.lstrip()[:300]
     return sample.startswith("<?xml") or sample.startswith("<nmaprun")
+
+
+def looks_like_gnmap(text: str) -> bool:
+    for line in text.splitlines():
+        if line.startswith("Host:") and ("Status:" in line or "Ports:" in line):
+            return True
+    return False
 
 
 def parse_nmap_xml(text: str, state: ScanState, source: str, raw_file: str = "") -> None:
@@ -1349,13 +1508,23 @@ def first_meaningful_line(output: str) -> str:
 
 def parse_nmap_gnmap(text: str, state: ScanState, source: str) -> None:
     for line in text.splitlines():
-        if not line.startswith("Host:") or "Ports:" not in line:
+        if not line.startswith("Host:"):
             continue
-        match = re.match(r"Host:\s+(\S+)\s+\(([^)]*)\).*Ports:\s+(.*)", line)
+        host_match = re.match(r"Host:\s+(\S+)\s+\(([^)]*)\)", line)
+        if not host_match:
+            continue
+        ip, hostname = host_match.groups()
+        if "Status:" in line:
+            status = extract_regex(line, r"Status:\s*([A-Za-z]+)").lower()
+            if status and status != "up":
+                continue
+        state.upsert_host(ip, hostname=hostname if hostname else "", aliases=[hostname] if hostname else [], sources=[f"gnmap:{source}"])
+        if "Ports:" not in line:
+            continue
+        match = re.search(r"Ports:\s+([^\t]+)", line)
         if not match:
             continue
-        ip, hostname, ports_text = match.groups()
-        state.upsert_host(ip, hostname=hostname if hostname else "", aliases=[hostname] if hostname else [], sources=[f"gnmap:{source}"])
+        ports_text = match.group(1)
         for entry in ports_text.split(","):
             parts = entry.strip().split("/")
             if len(parts) < 5:
@@ -2087,6 +2256,10 @@ def probe_web_endpoint(
     if args.proxy:
         command.extend(["--proxy", args.proxy])
     command.append(url)
+    
+    # User requested a 3s wait to allow complete data to load (best effort for curl/servers)
+    time.sleep(3)
+    
     result = run_command(
         command,
         timeout=timeout + 3,
@@ -2110,6 +2283,10 @@ def probe_web_endpoint(
     response_size = response_size_for_body(body_file, meta)
     content_length = header_int(headers, "content-length")
     technologies = detect_web_technologies(headers, body_sample)
+    favicon_url = ""
+    favicon_file = ""
+    if path == "/":
+        favicon_url, favicon_file = fetch_favicon(args, state, url, body_sample, timeout, logger)
     endpoint = WebEndpoint(
         url=url,
         ip=service.ip,
@@ -2128,6 +2305,8 @@ def probe_web_endpoint(
         interesting=False,
         raw_headers_file=relpath(headers_file, state.output_dir) if headers_file.exists() else "",
         body_sample_file=relpath(body_file, state.output_dir) if body_file.exists() else "",
+        favicon_url=favicon_url,
+        favicon_file=favicon_file,
     )
     endpoint.interesting, endpoint.finding_reason = classify_web_endpoint(endpoint)
     return endpoint
@@ -2233,6 +2412,100 @@ def extract_title(body: str) -> str:
     return html.unescape(title)[:240]
 
 
+def fetch_favicon(
+    args: argparse.Namespace,
+    state: ScanState,
+    base_url: str,
+    body_sample: str,
+    timeout: int,
+    logger: Logger,
+) -> tuple[str, str]:
+    raw_dir = Path(state.output_dir) / RAW_DIR / "web" / "favicons"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    for favicon_url in favicon_candidate_urls(base_url, body_sample)[:4]:
+        parsed = urllib.parse.urlparse(favicon_url)
+        suffix = Path(parsed.path).suffix.lower()
+        if suffix not in {".ico", ".png", ".svg", ".jpg", ".jpeg", ".gif", ".webp"}:
+            suffix = ".ico"
+        slug = safe_filename(f"{parsed.scheme}_{parsed.netloc}_{parsed.path.strip('/') or 'favicon'}")
+        if not Path(slug).suffix:
+            slug += suffix
+        icon_file = raw_dir / slug
+        meta_file = raw_dir / f"{slug}.command.txt"
+        command = [
+            "curl",
+            "--silent",
+            "--show-error",
+            "--insecure",
+            "--connect-timeout",
+            str(max(1, min(timeout, 10))),
+            "--max-time",
+            str(max(1, timeout)),
+            "--user-agent",
+            args.user_agent,
+            "--location",
+            "--max-redirs",
+            "3",
+            "--output",
+            str(icon_file),
+            "--write-out",
+            "BIRDSCAN_META:%{response_code}|%{url_effective}|%{content_type}|%{redirect_url}|%{size_download}",
+            "--max-filesize",
+            "262144",
+        ]
+        if args.proxy:
+            command.extend(["--proxy", args.proxy])
+        command.append(favicon_url)
+        
+        time.sleep(3)
+        result = run_command(command, timeout=timeout + 3, output_file=meta_file, logger=logger)
+        meta = parse_curl_meta(result.stdout)
+        status_code = int(meta.get("status_code", 0) or 0)
+        content_type = str(meta.get("content_type", ""))
+        if (
+            result.returncode == 0
+            and 200 <= status_code <= 399
+            and icon_file.exists()
+            and icon_file.stat().st_size > 0
+            and is_probable_favicon(content_type, favicon_url)
+        ):
+            return favicon_url, relpath(icon_file, state.output_dir)
+        cleanup_empty_file(icon_file)
+        try:
+            if icon_file.exists():
+                icon_file.unlink()
+        except OSError:
+            pass
+    return "", ""
+
+
+def favicon_candidate_urls(base_url: str, body_sample: str) -> list[str]:
+    candidates: list[str] = []
+    for tag in re.findall(r"<link\b[^>]*>", body_sample or "", flags=re.I):
+        rel = html_attr_value(tag, "rel").lower()
+        href = html_attr_value(tag, "href")
+        if "icon" in rel and href:
+            candidates.append(urllib.parse.urljoin(base_url, html.unescape(href)))
+    candidates.append(urllib.parse.urljoin(base_url, "/favicon.ico"))
+    return dedupe_text([url for url in candidates if is_valid_web_url(url)])
+
+
+def html_attr_value(tag: str, name: str) -> str:
+    match = re.search(rf"\b{re.escape(name)}\s*=\s*(['\"])(.*?)\1", tag, flags=re.I | re.S)
+    if match:
+        return match.group(2).strip()
+    match = re.search(rf"\b{re.escape(name)}\s*=\s*([^\s>]+)", tag, flags=re.I)
+    return match.group(1).strip("'\"") if match else ""
+
+
+def is_probable_favicon(content_type: str, url: str) -> bool:
+    ctype = content_type.lower()
+    if any(token in ctype for token in ["image/", "icon", "svg"]):
+        return True
+    suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+    return suffix in {".ico", ".png", ".svg", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
 def header_lookup(headers: dict[str, str], name: str) -> str:
     wanted = name.lower()
     for key, value in headers.items():
@@ -2304,10 +2577,12 @@ def classify_web_endpoint(endpoint: WebEndpoint) -> tuple[bool, str]:
 def is_web_success(endpoint: WebEndpoint) -> bool:
     if not has_http_response(endpoint):
         return False
+    if endpoint.status_code in {404, 410} or endpoint.status_code >= 500:
+        return False
     ctype = endpoint.content_type.lower()
     if endpoint.title or "html" in ctype or "json" in ctype or endpoint.server:
         return True
-    return True
+    return endpoint.status_code in {200, 201, 202, 204, 301, 302, 307, 308, 401, 403}
 
 
 def is_reportable_web_endpoint(endpoint: WebEndpoint) -> bool:
@@ -2384,8 +2659,8 @@ def run_web_screenshots(args: argparse.Namespace, state: ScanState, logger: Logg
     url_file = screenshot_dir / "urls.txt"
     url_file.write_text("\n".join(urls) + "\n", encoding="utf-8")
     commands = [
-        ["gowitness", "scan", "file", "-f", str(url_file), "--screenshot-path", str(screenshot_dir)],
-        ["gowitness", "file", "-f", str(url_file), "--screenshot-path", str(screenshot_dir)],
+        ["gowitness", "scan", "file", "-f", str(url_file), "--delay", "3", "--screenshot-path", str(screenshot_dir)],
+        ["gowitness", "file", "-f", str(url_file), "--delay", "3", "--screenshot-path", str(screenshot_dir)],
     ]
     for command in commands:
         result = run_command(
@@ -2415,6 +2690,8 @@ def run_service_enumeration(args: argparse.Namespace, state: ScanState, logger: 
     run_database_enum(args, state, logger)
     run_generic_service_enum(args, state, logger)
     run_kerberos_user_enum_if_enabled(args, state, logger)
+    run_kerbrute_user_enum(args, state, logger)
+    run_credential_auth_enumeration(args, state, logger)
     save_state(state)
 
 
@@ -2502,16 +2779,417 @@ def credential_args(args: argparse.Namespace, tool: str = "nxc") -> tuple[list[s
             command_args.extend(["-p", args.password])
         else:
             command_args.append(args.password)
-        secrets.append(args.password)
     if args.ntlm_hash:
         if tool in {"nxc", "crackmapexec"}:
             command_args.extend(["-H", args.ntlm_hash])
         else:
             command_args.append(args.ntlm_hash)
-        secrets.append(args.ntlm_hash)
     if args.kerberos and tool in {"nxc", "crackmapexec"}:
         command_args.append("-k")
     return command_args, secrets
+
+
+@dataclass(frozen=True)
+class CredentialPair:
+    username: str
+    password: str
+
+
+def load_credential_list_file(path: str | None) -> list[str]:
+    if not path:
+        return []
+    file_path = Path(path)
+    if not file_path.is_file():
+        return []
+    entries: list[str] = []
+    for line in file_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        token = line.strip()
+        if not token or token.startswith("#"):
+            continue
+        if "#" in token:
+            token = token.split("#", 1)[0].strip()
+        if token:
+            entries.append(token)
+    return entries
+
+
+def collect_credential_usernames(args: argparse.Namespace) -> list[str]:
+    users: list[str] = []
+    if args.username:
+        users.append(args.username)
+    users.extend(load_credential_list_file(getattr(args, "username_file", None)))
+    return users
+
+
+def collect_credential_passwords(args: argparse.Namespace) -> list[str]:
+    passwords: list[str] = []
+    if args.password:
+        passwords.append(args.password)
+    passwords.extend(load_credential_list_file(getattr(args, "password_file", None)))
+    return passwords
+
+
+def resolve_auth_attack_mode(args: argparse.Namespace) -> str:
+    mode = getattr(args, "auth_attack_mode", "pitchfork") or "pitchfork"
+    if mode != "auto":
+        return mode
+    has_user_file = bool(getattr(args, "username_file", None))
+    has_pass_file = bool(getattr(args, "password_file", None))
+    users = collect_credential_usernames(args)
+    passwords = collect_credential_passwords(args)
+    if has_user_file and has_pass_file:
+        return "clusterbomb"
+    if args.username and has_pass_file:
+        return "single-user"
+    if has_user_file and args.password:
+        return "single-pass"
+    if len(users) <= 1 and len(passwords) <= 1:
+        return "single-user"
+    if len(users) == 1 and len(passwords) > 1:
+        return "single-user"
+    if len(users) > 1 and len(passwords) == 1:
+        return "single-pass"
+    if len(users) > 1 and len(passwords) > 1:
+        return "clusterbomb"
+    return "single-user"
+
+
+def build_credential_pairs(args: argparse.Namespace) -> tuple[list[CredentialPair], str]:
+    mode = resolve_auth_attack_mode(args)
+    users = collect_credential_usernames(args)
+    passwords = collect_credential_passwords(args)
+    if args.ntlm_hash and not passwords:
+        if not users:
+            users = [""]
+        return [CredentialPair(user, "") for user in users], mode
+    if not users or not passwords:
+        return [], mode
+    pairs: list[CredentialPair] = []
+    if mode == "pitchfork":
+        for username, password in zip(users, passwords):
+            pairs.append(CredentialPair(username, password))
+    elif mode == "clusterbomb":
+        for username in users:
+            for password in passwords:
+                pairs.append(CredentialPair(username, password))
+    elif mode == "single-user":
+        username = users[0]
+        for password in passwords:
+            pairs.append(CredentialPair(username, password))
+    elif mode == "single-pass":
+        password = passwords[0]
+        for username in users:
+            pairs.append(CredentialPair(username, password))
+    return pairs, mode
+
+
+def has_automated_credential_spray(args: argparse.Namespace) -> bool:
+    pairs, _ = build_credential_pairs(args)
+    return bool(pairs)
+
+
+def credential_args_for_attempt(
+    args: argparse.Namespace,
+    tool: str = "nxc",
+    *,
+    username: str = "",
+    password: str = "",
+) -> tuple[list[str], list[str]]:
+    command_args: list[str] = []
+    secrets: list[str] = []
+    if args.domain:
+        if tool in {"nxc", "crackmapexec"}:
+            command_args.extend(["-d", args.domain])
+        else:
+            command_args.append(args.domain)
+    if username:
+        if tool in {"nxc", "crackmapexec"}:
+            command_args.extend(["-u", username])
+        else:
+            command_args.append(username)
+    if password:
+        if tool in {"nxc", "crackmapexec"}:
+            command_args.extend(["-p", password])
+        else:
+            command_args.append(password)
+    if args.ntlm_hash:
+        if tool in {"nxc", "crackmapexec"}:
+            command_args.extend(["-H", args.ntlm_hash])
+        else:
+            command_args.append(args.ntlm_hash)
+    if args.kerberos and tool in {"nxc", "crackmapexec"}:
+        command_args.append("-k")
+    return command_args, secrets
+
+
+def nxc_auth_success(text: str) -> bool:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if stripped.startswith("[-]") or "status_logon_failure" in lower or "login failed" in lower:
+            continue
+        if "[+]" in stripped:
+            return True
+    return False
+
+
+def record_auth_attempt_evidence(
+    state: ScanState,
+    service: ServiceRecord,
+    *,
+    category: str,
+    protocol: str,
+    tool: str,
+    pair: CredentialPair,
+    mode: str,
+    success: bool,
+    command: str,
+    raw_output_file: str,
+    transcript: str = "",
+    uses_hash: bool = False,
+) -> None:
+    # Only report successful authentications; rejected ones are still in raw files
+    if not success:
+        return
+    username_display = pair.username or "(anonymous)"
+    severity = "high" if protocol in {"smb", "rdp", "winrm", "mssql"} else "medium"
+    auth_method = "ntlm-hash" if uses_hash and not pair.password else "password"
+    description = (
+        f"{tool} authentication accepted for {username_display} on "
+        f"{service.protocol.upper()}/{service.port} (mode={mode}, method={auth_method})."
+    )
+    state.add_evidence(
+        Evidence(
+            category=category,
+            ip=service.ip,
+            port=service.port,
+            service=protocol,
+            title=f"Auth accepted: {username_display} ({protocol})",
+            description=description,
+            command=command,
+            raw_output_file=raw_output_file,
+            severity=severity,
+            data={
+                "auth_result": "accepted",
+                "auth_mode": mode,
+                "auth_method": auth_method,
+                "username": pair.username,
+                "password": pair.password,
+                "protocol": protocol,
+                "tool": tool,
+                "output_excerpt": transcript[:4000],
+            },
+        )
+    )
+
+
+def auth_protocols_for_service(service: ServiceRecord) -> list[tuple[str, str]]:
+    group = service_group_name(service)
+    service_name = (service.service or "").lower()
+    descriptor = f"{service_name} {service.product.lower()} {service.version.lower()} {service.banner.lower()}"
+    protocols: list[tuple[str, str]] = []
+    if group == "SMB":
+        if has_tool("nxc"):
+            protocols.append(("smb", "nxc"))
+        if has_tool("crackmapexec"):
+            protocols.append(("smb", "crackmapexec"))
+    elif group == "LDAP/AD":
+        if has_tool("nxc"):
+            protocols.append(("ldap", "nxc"))
+    elif group == "RDP":
+        if has_tool("nxc"):
+            protocols.append(("rdp", "nxc"))
+    elif group == "FTP":
+        protocols.append(("ftp", "native"))
+        if has_tool("nxc"):
+            protocols.append(("ftp", "nxc"))
+    elif group == "WINRM":
+        if has_tool("nxc"):
+            protocols.append(("winrm", "nxc"))
+    elif group == "SSH":
+        if has_tool("nxc"):
+            protocols.append(("ssh", "nxc"))
+    elif group == "DATABASE/DATA":
+        if service.port in MYSQL_PORTS or "mysql" in descriptor:
+            if has_tool("nxc"):
+                protocols.append(("mysql", "nxc"))
+        if service.port in MSSQL_PORTS or any(token in descriptor for token in ["ms-sql", "mssql", "sql server"]):
+            if has_tool("nxc"):
+                protocols.append(("mssql", "nxc"))
+        if service.port in POSTGRES_PORTS or "postgres" in descriptor:
+            if shutil.which("psql"):
+                protocols.append(("postgres", "psql"))
+    return protocols
+
+
+def auth_capable_services(state: ScanState) -> list[ServiceRecord]:
+    services: list[ServiceRecord] = []
+    for service in state.services:
+        if service.protocol != "tcp":
+            continue
+        if auth_protocols_for_service(service):
+            services.append(service)
+    return sorted_services_unique(services)
+
+
+def run_nxc_auth_attempt(
+    args: argparse.Namespace,
+    state: ScanState,
+    logger: Logger,
+    raw_dir: Path,
+    service: ServiceRecord,
+    protocol: str,
+    pair: CredentialPair,
+    mode: str,
+    uses_hash: bool,
+) -> None:
+    cred_args, secrets = credential_args_for_attempt(args, "nxc", username=pair.username, password=pair.password)
+    if not cred_args and not uses_hash:
+        return
+    command = ["nxc", protocol, service.ip, "--port", str(service.port)] + cred_args
+    slug = safe_filename(f"{pair.username}_{pair.password or 'hash'}")
+    output_file = raw_dir / f"nxc_{protocol}_{safe_filename(service.ip)}_{service.port}_{slug}.txt"
+    result = run_service_command(command, output_file, args, logger, secrets)
+    success = nxc_auth_success(result.stdout + result.stderr)
+    record_auth_attempt_evidence(
+        state,
+        service,
+        category=protocol,
+        protocol=protocol,
+        tool="nxc",
+        pair=pair,
+        mode=mode,
+        success=success,
+        command=shell_join(result.redacted_command),
+        raw_output_file=relpath(result.output_file or "", state.output_dir),
+        transcript=result.stdout + result.stderr,
+        uses_hash=uses_hash,
+    )
+
+
+def run_crackmapexec_auth_attempt(
+    args: argparse.Namespace,
+    state: ScanState,
+    logger: Logger,
+    raw_dir: Path,
+    service: ServiceRecord,
+    pair: CredentialPair,
+    mode: str,
+    uses_hash: bool,
+) -> None:
+    cred_args, secrets = credential_args_for_attempt(args, "crackmapexec", username=pair.username, password=pair.password)
+    if not cred_args and not uses_hash:
+        return
+    command = ["crackmapexec", "smb", service.ip, "--port", str(service.port)] + cred_args
+    slug = safe_filename(f"{pair.username}_{pair.password or 'hash'}")
+    output_file = raw_dir / f"cme_smb_{safe_filename(service.ip)}_{service.port}_{slug}.txt"
+    result = run_service_command(command, output_file, args, logger, secrets)
+    success = nxc_auth_success(result.stdout + result.stderr)
+    record_auth_attempt_evidence(
+        state,
+        service,
+        category="smb",
+        protocol="smb",
+        tool="crackmapexec",
+        pair=pair,
+        mode=mode,
+        success=success,
+        command=shell_join(result.redacted_command),
+        raw_output_file=relpath(result.output_file or "", state.output_dir),
+        transcript=result.stdout + result.stderr,
+        uses_hash=uses_hash,
+    )
+
+
+def run_postgres_auth_attempt(
+    args: argparse.Namespace,
+    state: ScanState,
+    logger: Logger,
+    raw_dir: Path,
+    service: ServiceRecord,
+    pair: CredentialPair,
+    mode: str,
+) -> None:
+    if not pair.username:
+        return
+    env = os.environ.copy()
+    secrets: list[str] = []
+    if pair.password:
+        env["PGPASSWORD"] = pair.password
+        secrets.append(pair.password)
+    command = [
+        "psql",
+        "-h",
+        service.ip,
+        "-p",
+        str(service.port),
+        "-U",
+        pair.username,
+        "-d",
+        "postgres",
+        "-c",
+        "\\q",
+    ]
+    slug = safe_filename(f"{pair.username}_{pair.password}")
+    output_file = raw_dir / f"psql_{safe_filename(service.ip)}_{service.port}_{slug}.txt"
+    result = run_command(
+        command,
+        timeout=command_timeout(THREAD_LEVELS[args.threads_level]["timeout"], args, multiplier=3.0),
+        output_file=output_file,
+        logger=logger,
+        secrets=secrets,
+        env=env,
+    )
+    combined = result.stdout + result.stderr
+    lower = combined.lower()
+    success = result.returncode == 0 and "authentication failed" not in lower and "password authentication failed" not in lower
+    record_auth_attempt_evidence(
+        state,
+        service,
+        category="database",
+        protocol="postgres",
+        tool="psql",
+        pair=pair,
+        mode=mode,
+        success=success,
+        command=shell_join(redact_command(command, secrets)),
+        raw_output_file=relpath(result.output_file or "", state.output_dir),
+        transcript=combined,
+    )
+
+
+def run_credential_auth_enumeration(args: argparse.Namespace, state: ScanState, logger: Logger) -> None:
+    pairs, mode = build_credential_pairs(args)
+    uses_hash = bool(args.ntlm_hash and not collect_credential_passwords(args))
+    if not pairs:
+        return
+    users = collect_credential_usernames(args)
+    passwords = collect_credential_passwords(args)
+    warn_credential_list_size_mismatch(args, mode, users, passwords, logger, state)
+    services = auth_capable_services(state)
+    if not services:
+        logger.info("No auth-capable services found for credential attempts")
+        return
+    state.metadata["credential_spray_mode"] = mode
+    state.metadata["credential_spray_pairs"] = len(pairs)
+    state.metadata["credential_lists_execute_automated_spray"] = True
+    logger.info(
+        f"Running credential attempts mode={mode} with {len(pairs)} pair(s) across "
+        f"{len(services)} auth-capable service target(s)"
+    )
+    raw_dir = Path(state.output_dir) / RAW_DIR / "services" / "auth"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    for service in services:
+        for pair in pairs:
+            for protocol, tool in auth_protocols_for_service(service):
+                if tool == "nxc":
+                    run_nxc_auth_attempt(args, state, logger, raw_dir, service, protocol, pair, mode, uses_hash)
+                elif tool == "crackmapexec":
+                    run_crackmapexec_auth_attempt(args, state, logger, raw_dir, service, pair, mode, uses_hash)
+                elif tool == "psql":
+                    run_postgres_auth_attempt(args, state, logger, raw_dir, service, pair, mode)
 
 
 def run_smb_ad_enum(args: argparse.Namespace, state: ScanState, logger: Logger) -> None:
@@ -2540,7 +3218,7 @@ def run_smb_ad_enum(args: argparse.Namespace, state: ScanState, logger: Logger) 
             add_tool_evidence(state, "smb", ip, port, "crackmapexec smb", result, parse_smb_keywords(result.stdout + result.stderr))
             update_host_from_smb_text(state, ip, result.stdout + result.stderr)
         if has_tool("smbclient"):
-            command = ["smbclient", "-L", f"//{ip}", "-N", "-g", "-p", str(port)]
+            command = ["smbclient", "-L", f"//{ip}", "-N", "-p", str(port)]
             result = run_service_command(command, raw_dir / f"smbclient_list_{safe_filename(ip)}_{port}.txt", args, logger, [])
             add_tool_evidence(state, "smb", ip, port, "smbclient anonymous list", result, parse_smb_keywords(result.stdout + result.stderr))
             if "Disk|" in result.stdout or "Sharename" in result.stdout:
@@ -2752,31 +3430,36 @@ def run_ftp_auth_attempts(
     raw_dir: Path,
     service: ServiceRecord,
 ) -> None:
-    attempts = [
-        ("anonymous", "anonymous@"),
-        ("ftp", "ftp"),
+    pairs, mode = build_credential_pairs(args)
+    attempts: list[tuple[str, str, str]] = [
+        ("anonymous", "anonymous@", "anonymous"),
+        ("ftp", "ftp", "anonymous"),
     ]
+    seen = {(username, password) for username, password, _ in attempts}
+    for pair in pairs:
+        key = (pair.username, pair.password)
+        if key not in seen:
+            attempts.append((pair.username, pair.password, mode))
+            seen.add(key)
     timeout = THREAD_LEVELS[args.threads_level]["timeout"]
-    for username, password in attempts:
+    for username, password, attempt_mode in attempts:
         success, transcript = try_ftp_login(service.ip, service.port, username, password, timeout)
         raw_file = raw_dir / f"ftp_auth_{safe_filename(service.ip)}_{service.port}_{safe_filename(username)}.txt"
         raw_file.write_text(transcript, encoding="utf-8", errors="replace")
         if not success:
             logger.debug(f"FTP auth rejected for {service.ip}:{service.port} with {username}")
-            continue
-        state.add_evidence(
-            Evidence(
-                category="ftp",
-                ip=service.ip,
-                port=service.port,
-                service="ftp",
-                title=f"FTP login accepted: {username}",
-                description=f"FTP accepted {username} authentication on TCP/{service.port}.",
-                command=f"ftp {service.ip} {service.port} # user={username}",
-                raw_output_file=relpath(raw_file, state.output_dir),
-                severity="medium",
-                data={"username": username},
-            )
+        record_auth_attempt_evidence(
+            state,
+            service,
+            category="ftp",
+            protocol="ftp",
+            tool="ftp",
+            pair=CredentialPair(username, password),
+            mode=attempt_mode,
+            success=success,
+            command=f"ftp {service.ip} {service.port} # user={username}",
+            raw_output_file=relpath(raw_file, state.output_dir),
+            transcript=transcript,
         )
 
 
@@ -2837,6 +3520,27 @@ def run_database_enum(args: argparse.Namespace, state: ScanState, logger: Logger
                 command = ["nmap", "-Pn", "-p", str(service.port), "--script", script, service.ip]
                 result = run_service_command(command, raw_dir / f"nmap_{name}_{safe_filename(service.ip)}_{service.port}.txt", args, logger, [])
                 add_tool_evidence(state, name, service.ip, service.port, f"nmap {script}", result, parse_generic_keywords(result.stdout + result.stderr))
+            
+            if name == "mysql" and has_tool("mysql"):
+                command = ["mysql", "-h", service.ip, "-P", str(service.port), "-u", "root", "-e", "quit"]
+                result = run_service_command(command, raw_dir / f"mysql_anon_{safe_filename(service.ip)}_{service.port}.txt", args, logger, [])
+                success = result.returncode == 0 and "Access denied" not in result.stderr
+                record_auth_attempt_evidence(
+                    state, service, category="database", protocol="mysql", tool="mysql",
+                    pair=CredentialPair("root", ""), mode="anonymous", success=success,
+                    command=shell_join(command), raw_output_file=relpath(result.output_file or "", state.output_dir), transcript=result.stdout + result.stderr
+                )
+            
+            if name == "postgresql" and has_tool("psql"):
+                command = ["psql", "-h", service.ip, "-p", str(service.port), "-U", "postgres", "-d", "postgres", "-c", "\\q"]
+                result = run_service_command(command, raw_dir / f"psql_anon_{safe_filename(service.ip)}_{service.port}.txt", args, logger, [])
+                success = result.returncode == 0 and "authentication failed" not in (result.stdout + result.stderr).lower()
+                record_auth_attempt_evidence(
+                    state, service, category="database", protocol="postgres", tool="psql",
+                    pair=CredentialPair("postgres", ""), mode="anonymous", success=success,
+                    command=shell_join(command), raw_output_file=relpath(result.output_file or "", state.output_dir), transcript=result.stdout + result.stderr
+                )
+
             if name == "mssql" and has_tool("nxc"):
                 cred_args, secrets = credential_args(args, "nxc")
                 command = ["nxc", "mssql", service.ip, "--port", str(service.port)] + cred_args
@@ -2895,6 +3599,37 @@ def run_generic_service_enum(args: argparse.Namespace, state: ScanState, logger:
                     command.insert(1, "-sU")
                 result = run_service_command(command, raw_dir / f"nmap_{name}_{safe_filename(service.ip)}_{service.port}.txt", args, logger, [])
                 add_tool_evidence(state, name, service.ip, service.port, f"nmap {script}", result, parse_generic_keywords(result.stdout + result.stderr))
+            
+            if name == "redis" and has_tool("redis-cli"):
+                command = ["redis-cli", "-h", service.ip, "-p", str(service.port), "INFO"]
+                result = run_service_command(command, raw_dir / f"redis_anon_{safe_filename(service.ip)}_{service.port}.txt", args, logger, [])
+                success = result.returncode == 0 and "NOAUTH Authentication required" not in result.stderr and "redis_version" in result.stdout
+                record_auth_attempt_evidence(
+                    state, service, category="database", protocol="redis", tool="redis-cli",
+                    pair=CredentialPair("", ""), mode="anonymous", success=success,
+                    command=shell_join(command), raw_output_file=relpath(result.output_file or "", state.output_dir), transcript=result.stdout + result.stderr
+                )
+
+            if name == "mongodb" and has_tool("mongosh"):
+                command = ["mongosh", "--host", service.ip, "--port", str(service.port), "--eval", "quit()"]
+                result = run_service_command(command, raw_dir / f"mongo_anon_{safe_filename(service.ip)}_{service.port}.txt", args, logger, [])
+                success = result.returncode == 0 and "AuthenticationFailed" not in (result.stdout + result.stderr)
+                record_auth_attempt_evidence(
+                    state, service, category="database", protocol="mongodb", tool="mongosh",
+                    pair=CredentialPair("", ""), mode="anonymous", success=success,
+                    command=shell_join(command), raw_output_file=relpath(result.output_file or "", state.output_dir), transcript=result.stdout + result.stderr
+                )
+
+            if name == "snmp" and has_tool("snmpwalk"):
+                command = ["snmpwalk", "-v2c", "-c", "public", f"udp:{service.ip}:{service.port}", "1.3.6.1.2.1.1.1"]
+                result = run_service_command(command, raw_dir / f"snmp_public_{safe_filename(service.ip)}_{service.port}.txt", args, logger, [])
+                success = result.returncode == 0 and "Timeout" not in result.stderr and "No Response from" not in result.stdout
+                record_auth_attempt_evidence(
+                    state, service, category="snmp", protocol="snmp", tool="snmpwalk",
+                    pair=CredentialPair("public", ""), mode="community", success=success,
+                    command=shell_join(command), raw_output_file=relpath(result.output_file or "", state.output_dir), transcript=result.stdout + result.stderr
+                )
+
             severity = "low" if name in {"winrm", "docker", "kubernetes", "redis", "mongodb", "elasticsearch", "vnc", "telnet"} else "info"
             state.add_evidence(
                 Evidence(
@@ -2948,6 +3683,87 @@ def run_kerberos_user_enum_if_enabled(args: argparse.Namespace, state: ScanState
         add_tool_evidence(state, "kerberos", ip, port, "nmap krb5-enum-users", result, parse_generic_keywords(result.stdout + result.stderr))
 
 
+def run_kerbrute_user_enum(args: argparse.Namespace, state: ScanState, logger: Logger) -> None:
+    """Run kerbrute userenum against all hosts with Kerberos port 88 open."""
+    if not has_tool("kerbrute"):
+        logger.info("kerbrute not available; skipping Kerberos user brute-force enumeration")
+        return
+    services = [
+        service
+        for service in services_by_ports_or_group(state, KERBEROS_PORTS, "KERBEROS", {"tcp"})
+        if service.port == 88 or "kerberos" in (service.service or "").lower()
+    ]
+    if not services:
+        return
+    realm = resolve_kerberos_realm(args, state)
+    if not realm:
+        logger.warn("No Kerberos realm available (use --kerberos-realm or ensure domain is discovered); skipping kerbrute")
+        return
+    wordlist = resolve_kerbrute_wordlist(args)
+    if not wordlist:
+        logger.warn("No kerbrute user wordlist found in SecLists paths; skipping kerbrute userenum")
+        return
+    raw_dir = Path(state.output_dir) / RAW_DIR / "services" / "kerberos"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Running kerbrute userenum against {len(services)} Kerberos target(s) with realm {realm}")
+    seen_ips: set[str] = set()
+    for service in services:
+        ip = service.ip
+        if ip in seen_ips:
+            continue
+        seen_ips.add(ip)
+        port = service.port
+        command = ["kerbrute", "userenum", "--dc", f"{ip}:{port}", "-d", realm, str(wordlist)]
+        result = run_service_command(command, raw_dir / f"kerbrute_userenum_{safe_filename(ip)}_{port}.txt", args, logger, [])
+        parsed = parse_kerbrute_results(result.stdout + result.stderr)
+        add_tool_evidence(state, "kerberos", ip, port, "kerbrute userenum", result, parsed)
+
+
+def resolve_kerberos_realm(args: argparse.Namespace, state: ScanState) -> str:
+    """Determine Kerberos realm: explicit CLI > discovered domain from hosts."""
+    if getattr(args, "kerberos_realm", None):
+        return args.kerberos_realm
+    hosts = list(state.hosts.values())
+    domains = discovered_local_domains(hosts)
+    if domains:
+        return domains[0].upper()
+    for host in hosts:
+        if host.domain:
+            return host.domain.strip().strip(".").upper()
+    return ""
+
+
+def resolve_kerbrute_wordlist(args: argparse.Namespace) -> str:
+    """Find the best available kerbrute user wordlist from SecLists."""
+    custom = getattr(args, "user_enum_wordlist", None)
+    if custom and Path(custom).is_file():
+        return custom
+    for candidate in KERBRUTE_USER_WORDLIST_CANDIDATES:
+        if Path(candidate).is_file():
+            return candidate
+    return ""
+
+
+def parse_kerbrute_results(text: str) -> dict[str, Any]:
+    """Parse kerbrute output for valid usernames."""
+    parsed: dict[str, Any] = {}
+    valid_users: list[str] = []
+    for line in text.splitlines():
+        lower = line.lower()
+        if "valid_username" in lower or "[+]" in line:
+            # kerbrute outputs: YYYY/MM/DD HH:MM:SS >  [+] VALID USERNAME:  user@REALM
+            match = re.search(r"valid[_ ]username:?\s+([^\s@]+)", line, re.IGNORECASE)
+            if match:
+                valid_users.append(match.group(1))
+    if valid_users:
+        parsed["valid_users"] = valid_users
+        parsed["severity"] = "medium"
+        parsed["description"] = f"Kerbrute found {len(valid_users)} valid username(s): {', '.join(valid_users[:10])}"
+        if len(valid_users) > 10:
+            parsed["description"] += f" (+{len(valid_users) - 10} more)"
+    return parsed
+
+
 def run_service_command(
     command: list[str],
     output_file: Path,
@@ -2976,8 +3792,22 @@ def add_tool_evidence(
 ) -> None:
     if not result.stdout.strip() and not result.stderr.strip():
         return
+    # Skip failed commands unless parsed data has interesting findings
+    has_interesting_parsed = any(
+        key not in {"severity", "description", "contains_version_info"}
+        for key in parsed
+    )
+    if result.returncode != 0 and not has_interesting_parsed:
+        return
     severity = parsed.pop("severity", "info")
-    description = parsed.pop("description", f"{title} completed with return code {result.returncode}.")
+    command_str = shell_join(result.command)
+    if "description" in parsed:
+        description = parsed.pop("description")
+    else:
+        description = f"Comando manual: `{command_str}`"
+    # Store stdout excerpt for inline expandable display
+    if result.returncode == 0 and result.stdout.strip():
+        parsed["output_excerpt"] = result.stdout.strip()[:4000]
     state.add_evidence(
         Evidence(
             category=category,
@@ -2986,7 +3816,7 @@ def add_tool_evidence(
             service=category,
             title=title,
             description=description,
-            command=shell_join(result.redacted_command),
+            command=shell_join(result.command),
             raw_output_file=relpath(result.output_file or "", state.output_dir),
             severity=severity,
             data=parsed,
@@ -3003,6 +3833,15 @@ def parse_smb_keywords(text: str) -> dict[str, Any]:
         parsed["smb_signing"] = "disabled_or_not_required"
     elif "signing:" in lower:
         parsed["smb_signing"] = extract_after(text, "signing:")
+    # Detect SMBv1 enabled from nxc/crackmapexec/nmap output
+    smbv1_detected = detect_smbv1_enabled(text)
+    if smbv1_detected:
+        parsed["smbv1_enabled"] = True
+        if parsed.get("severity") != "high":
+            parsed["severity"] = "high"
+        existing_desc = parsed.get("description", "")
+        smbv1_desc = "SMBv1 is enabled on this host. This is a critical security risk."
+        parsed["description"] = f"{existing_desc} {smbv1_desc}".strip()
     domain = extract_regex(text, r"(?:domain|domain name|workgroup)[:=]\s*([A-Za-z0-9_.-]+)")
     hostname = extract_regex(text, r"(?:name|hostname|computer name)[:=]\s*([A-Za-z0-9_.-]+)")
     os_text = extract_regex(text, r"(?:os|platform)[:=]\s*([^\n\r]+)")
@@ -3017,6 +3856,32 @@ def parse_smb_keywords(text: str) -> dict[str, Any]:
         parsed["description"] = "Tool output suggests anonymous/null SMB access."
         parsed["anonymous_or_null_session"] = True
     return parsed
+
+
+def detect_smbv1_enabled(text: str) -> bool:
+    """Detect if SMBv1 is enabled from nxc, crackmapexec, or nmap output."""
+    lower = text.lower()
+    # nxc / crackmapexec pattern: SMBv1:True or SMBv1 : True
+    if re.search(r"smbv1\s*[:=]\s*true", lower):
+        return True
+    # nmap smb-protocols script output: lists dialects, SMBv1 shows as "NT LM 0.12" or just "1"
+    if "nt lm 0.12" in lower:
+        return True
+    # nmap smb-protocols listing versions like "  1.0" or "  1"
+    if re.search(r"smb[\s-]*protocols?", lower):
+        # Look for explicit version 1 in protocol listing
+        if re.search(r"\b(?:smb\s*)?(?:version\s*)?1(?:\.0)?\b", lower) and "smb" in lower:
+            # Exclude false positives like SMB2.1 or SMB3.1.1
+            for line in text.splitlines():
+                line_stripped = line.strip().lower()
+                if re.match(r"^\s*(?:nt lm 0\.12|1(?:\.0)?\s*$)", line_stripped):
+                    return True
+    # Generic patterns from various tools
+    if "smbv1 enabled" in lower or "smb1 enabled" in lower:
+        return True
+    if "dialects:" in lower and "nt lm" in lower:
+        return True
+    return False
 
 
 def parse_generic_keywords(text: str) -> dict[str, Any]:
@@ -3590,6 +4455,21 @@ def generate_html_report(state: ScanState) -> Path:
       overflow-wrap: anywhere;
       word-break: break-word;
     }}
+    .web-title {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+      max-width: 100%;
+    }}
+    .favicon-img {{
+      width: 18px;
+      height: 18px;
+      object-fit: contain;
+      border-radius: 3px;
+      background: rgba(255, 255, 255, 0.08);
+      flex: 0 0 auto;
+    }}
     .service-group-actions {{
       display: flex;
       gap: 8px;
@@ -3640,6 +4520,44 @@ def generate_html_report(state: ScanState) -> Path:
       font-family: var(--font-mono);
       font-size: 12px;
       line-height: 1.45;
+    }}
+    .raw-details {{
+      margin-top: 8px;
+      width: 100%;
+    }}
+    .raw-details summary {{
+      cursor: pointer;
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }}
+    .raw-body {{
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }}
+    .raw-toolbar {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .raw-output {{
+      width: 100%;
+      min-height: 220px;
+      max-height: 520px;
+      resize: vertical;
+      overflow: auto;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 6px;
+      background: #020617;
+      color: #e2e8f0;
+      padding: 10px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre;
     }}
     .copy-buffer {{
       position: fixed;
@@ -3945,6 +4863,21 @@ def generate_html_report(state: ScanState) -> Path:
       white-space: pre-wrap;
       overflow-wrap: anywhere;
     }}
+    .enum-target-list {{
+      display: grid;
+      gap: 7px;
+      margin-bottom: 10px;
+    }}
+    .enum-target-row {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: baseline;
+      padding: 7px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: rgba(2, 6, 23, 0.5);
+    }}
     .table-wrap {{
       overflow: auto;
       border: 1px solid var(--line);
@@ -4218,6 +5151,7 @@ def overview_panel(
     web_evidence_urls = {str(item.data.get("url")) for item in evidence if item.category == "web" and item.data.get("url")}
     prioritized_web = len([endpoint for endpoint in endpoints if endpoint.interesting or endpoint.url in web_evidence_urls])
     unique_ports = len({(svc.port, svc.protocol) for svc in services})
+    local_domains = discovered_local_domains(hosts)
     charts_html = overview_charts(hosts, services, endpoints)
     overview = f"""
       <div class="overview-grid">
@@ -4228,6 +5162,7 @@ def overview_panel(
         <div class="panel">
           <h2>Mapa Rápido</h2>
           <div class="kv-grid">
+            <div class="kv"><span>Domínios locais</span><div>{domain_summary_html(local_domains)}</div></div>
             <div class="kv"><span>Hosts catalogados</span><strong>{h(len(hosts))}</strong></div>
             <div class="kv"><span>Portas abertas</span><strong>{h(len(services))}</strong></div>
             <div class="kv"><span>Hosts com web</span><strong>{h(web_hosts)}</strong></div>
@@ -4247,6 +5182,44 @@ def overview_panel(
       </div>
     """
     return overview
+
+
+def discovered_local_domains(hosts: list[HostRecord]) -> list[str]:
+    domains: list[str] = []
+    for host in hosts:
+        if host.domain:
+            domains.append(host.domain.strip().strip(".").lower())
+        for name in [host.fqdn, host.hostname, *host.aliases]:
+            suffix = domain_suffix_from_hostname(name)
+            if suffix:
+                domains.append(suffix)
+    return sorted(dedupe_text([domain for domain in domains if domain]))
+
+
+def domain_suffix_from_hostname(value: str) -> str:
+    name = (value or "").strip().strip(".").lower()
+    if not name or "." not in name:
+        return ""
+    try:
+        ipaddress.ip_address(name)
+        return ""
+    except ValueError:
+        pass
+    labels = [label for label in name.split(".") if label]
+    if len(labels) >= 3:
+        return ".".join(labels[1:])
+    if len(labels) == 2:
+        return ".".join(labels)
+    return ""
+
+
+def domain_summary_html(domains: list[str]) -> str:
+    if not domains:
+        return h("-")
+    shown = domains[:8]
+    extra = len(domains) - len(shown)
+    extra_html = f'<span class="pill">+{h(extra)}</span>' if extra > 0 else ""
+    return pill_list(shown) + extra_html
 
 
 def overview_charts(hosts: list[HostRecord], services: list[ServiceRecord], endpoints: list[WebEndpoint]) -> str:
@@ -4511,8 +5484,9 @@ def service_group_dashboard(
             item
             for host in hosts
             for item in evidence_by_host.get(host, [])
-            if item.port is None or any(item.port == service.port for service in group_services if service.ip == host)
+            if evidence_matches_service_group(item, group_name, group_services)
         ]
+        group_enum_evidence = [item for item in group_evidence if not is_group_enum_noise_evidence(item)]
         filter_text = row_filter(
             group_name,
             hosts,
@@ -4528,13 +5502,13 @@ def service_group_dashboard(
             f'{metric_pill("hosts", len(hosts))}'
             f'{metric_pill("serviços", len(group_services))}'
             f'{metric_pill("web", len(group_endpoints))}'
-            f'{metric_pill("evidências", len(group_evidence))}'
+            f'{metric_pill("evidências", len(group_enum_evidence))}'
             "</span>"
             "</summary>"
             '<div class="group-body">'
             f"{service_group_actions(group_name, group_services)}"
             f"{service_group_body(group_name, group_services, group_endpoints, endpoints_by_host_port, state)}"
-            f"{enumeration_details_block(group_evidence, state, title='Informações de Enumeração do Grupo')}"
+            f"{grouped_enumeration_details_block(group_enum_evidence, state, title='Informações de Enumeração do Grupo')}"
             "</div>"
             "</details>"
         )
@@ -4551,6 +5525,8 @@ def service_group_body(
 ) -> str:
     if group_name == "WEB":
         return web_service_group_dashboard(services, endpoints, state)
+    if group_name == "SMB":
+        return smb_service_group_table(services, endpoints_by_host_port, state)
     return service_group_table(services, endpoints_by_host_port, state)
 
 
@@ -4562,21 +5538,29 @@ def service_group_actions(group_name: str, services: list[ServiceRecord]) -> str
     return (
         '<div class="service-group-actions">'
         f'<span class="muted">{h(group_name)}: {h(len(targets))} alvo(s) ativo(s)</span>'
-        f'<div class="copy-actions">{copy_commands_button("Copiar IP:porta", targets)}{command_buttons}</div>'
+        f'<div class="copy-actions">{copy_commands_button("Copiar IP:porta", targets)}{copy_commands_button("Copiar IPs", service_group_ips(services))}{command_buttons}</div>'
         "</div>"
     )
 
 
 def service_group_command_buttons(services: list[ServiceRecord]) -> str:
-    commands_by_tool: dict[str, list[str]] = {}
-    for service in sorted_services_unique(services):
+    sorted_services = sorted_services_unique(services)
+    commands_by_tool: dict[str, list[tuple[ServiceRecord, list[str]]]] = {}
+    for service in sorted_services:
         for tool, commands in service_primary_commands_by_tool(service).items():
-            commands_by_tool.setdefault(tool, []).extend(commands)
-    buttons = [
-        copy_commands_button(tool, dedupe_text(commands))
-        for tool, commands in commands_by_tool.items()
-        if commands
-    ]
+            commands_by_tool.setdefault(tool, []).append((service, commands))
+    buttons: list[str] = []
+    for tool, entries in commands_by_tool.items():
+        tool_services = [service for service, commands in entries if commands]
+        if len(tool_services) > 1:
+            loop_command = service_tool_loop_command(tool, tool_services)
+            if loop_command:
+                buttons.append(copy_commands_button(tool, [loop_command]))
+                continue
+        commands: list[str] = []
+        for _, service_commands in entries:
+            commands.extend(service_commands)
+        buttons.append(copy_commands_button(tool, dedupe_text(commands), loop_multiple=True))
     return "".join(buttons)
 
 
@@ -4586,6 +5570,85 @@ def service_group_targets(services: list[ServiceRecord]) -> list[str]:
         for service in sorted(services, key=lambda item: (ip_sort_key(item.ip), item.port, item.protocol))
     ]
     return dedupe_text(values)
+
+
+def service_group_ips(services: list[ServiceRecord]) -> list[str]:
+    return dedupe_text(service.ip for service in sorted(services, key=lambda item: (ip_sort_key(item.ip), item.port, item.protocol)))
+
+
+def service_tool_loop_command(tool: str, services: list[ServiceRecord]) -> str:
+    unique_services = sorted_services_unique(services)
+    specs = " ".join(shlex_quote(service_loop_spec(tool, service)) for service in unique_services)
+    if not specs:
+        return ""
+    body = service_tool_loop_body(tool)
+    if not body:
+        return ""
+    log_file = f"birdscan-{safe_filename(tool.lower())}-all-targets.txt"
+    setup = 'IFS="|" read -r ip port proto extra <<< "$spec"; host="$ip"; case "$host" in *:*) host="[$host]";; esac'
+    return f'for spec in {specs}; do {setup}; {body}; done 2>&1 | tee -a {shlex_quote(log_file)}'
+
+
+def service_loop_spec(tool: str, service: ServiceRecord) -> str:
+    parts = [service.ip, str(service.port), service.protocol, ""]
+    if tool == "Nmap NSE":
+        parts[-1] = service_nmap_scripts(service)
+    return "|".join(parts)
+
+
+def h_shell_label(value: str) -> str:
+    return value.replace('"', "'")
+
+
+def service_tool_loop_body(tool: str) -> str:
+    bodies = {
+        "Nmap Versão": 'udp=""; case "$proto" in udp) udp="-sU";; esac; nmap $udp -sV --version-all --reason -Pn -p "$port" "$ip"',
+        "Nmap NSE": 'udp=""; case "$proto" in udp) udp="-sU";; esac; nmap $udp -sV -Pn -p "$port" --script "$extra" "$ip"',
+        "NetCat": 'nc -nv "$ip" "$port"',
+        "CURL": 'scheme="http"; case "$port" in 443|8443|9443|5986|2376) scheme="https";; esac; curl -k -i -L --max-time 10 -A Mozilla/5.0 "${scheme}://${host}:${port}/"',
+        "WhatWeb": 'scheme="http"; case "$port" in 443|8443|9443|5986|2376) scheme="https";; esac; whatweb --no-errors "${scheme}://${host}:${port}/"',
+        "SMBClient": 'smbclient -L "//$ip" -N -p "$port"',
+        "NXC": 'nxc smb "$ip" --port "$port" --shares',
+        "CrackMapExec": 'crackmapexec smb "$ip" --port "$port" --shares',
+        "RPCClient": 'rpcclient -U "" -N "$ip" -p "$port" -c srvinfo',
+        "Impacket": 'printf "shares\\nexit\\n" | impacket-smbclient -port "$port" -no-pass "$ip"',
+        "XFreeRDP": 'xfreerdp /v:"$ip:$port" /cert:ignore /dynamic-resolution',
+        "RDesktop": 'rdesktop "$ip:$port"',
+        "NXC RDP": 'nxc rdp "$ip" --port "$port"',
+        "SSH": 'ssh -p "$port" "user@$ip"',
+        "FTP anonymous": 'printf "anonymous\\nanonymous\\npwd\\nls\\nbye\\n" | ftp -inv -p "$ip" "$port"',
+        "FTP ftp": 'printf "ftp\\nftp\\npwd\\nls\\nbye\\n" | ftp -inv -p "$ip" "$port"',
+        "LFTP anon": 'lftp -u anonymous,anonymous -p "$port" "$ip" -e "pwd; ls; bye"',
+        "LFTP ftp": 'lftp -u ftp,ftp -p "$port" "$ip" -e "pwd; ls; bye"',
+        "NXC FTP": 'nxc ftp "$ip" --port "$port"',
+        "LDAPSearch": 'scheme="ldap"; case "$port" in 636|3269) scheme="ldaps";; esac; ldapsearch -x -H "${scheme}://${host}:${port}" -s base',
+        "NXC LDAP": 'nxc ldap "$ip" --port "$port"',
+        "KRB5 info": 'nmap -sV -Pn -p "$port" --script krb5-info "$ip"',
+        "Kerbrute userenum": 'kerbrute userenum --dc "$ip:$port" -d "$extra" /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt',
+        "Kerbrute passwordspray": 'kerbrute passwordspray --dc "$ip:$port" -d "$extra" /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt Senha123!',
+        "Impacket GetNPUsers": 'impacket-GetNPUsers "$extra"/ -no-pass -usersfile lista-de-user-valido.txt -format hashcat -outputfile hashes-found.txt -dc-ip "$ip"',
+        "MySQL": 'mysql -h "$ip" -P "$port" -u root -p',
+        "Postgres": 'psql -h "$ip" -p "$port" -U postgres',
+        "MSSQL": 'impacket-mssqlclient -port "$port" user:pass@"$ip"; nxc mssql "$ip" --port "$port"',
+        "NXC MSSQL": 'nxc mssql "$ip" --port "$port"',
+        "Redis": 'redis-cli -h "$ip" -p "$port" INFO',
+        "Mongo": 'mongosh --host "$ip" --port "$port"',
+        "Elastic": 'curl -s "http://${host}:${port}/_cluster/health?pretty"',
+        "Evil-WinRM": 'evil-winrm -i "$ip" -P "$port" -u user -p password',
+        "NXC WinRM": 'nxc winrm "$ip" --port "$port"',
+        "Showmount": 'showmount -e "$ip"',
+        "RPCInfo": 'rpcinfo -p "$ip"',
+        "SNMPWalk": 'snmpwalk -v2c -c public "udp:${ip}:${port}"',
+        "VNCViewer": 'vncviewer "$ip::$port"',
+        "CURL HTTPS": 'curl -k -i "https://${host}:${port}/version"',
+        "CURL HTTP": 'curl -i "http://${host}:${port}/version"',
+        "Telnet": 'telnet "$ip" "$port"',
+        "Swaks": 'swaks --server "$ip" --port "$port" --quit-after HELO',
+        "OpenSSL": 'openssl s_client -connect "$ip:$port" -servername "$ip"',
+        "DIG version": 'dig @"$ip" -p "$port" version.bind chaos txt',
+        "DIG AXFR": 'dig @"$ip" -p "$port" axfr domain.local',
+    }
+    return bodies.get(tool, "")
 
 
 def host_port_value(ip: str, port: int) -> str:
@@ -4757,12 +5820,26 @@ def web_endpoint_line(endpoint: WebEndpoint, state: ScanState, custom_wordlist: 
         f'<div class="web-col"><span class="web-col-label">Status</span><span class="mono">{h(endpoint.status_code)}</span></div>'
         f'<div class="web-col web-url"><span class="web-col-label">URL</span>{web_url_link(endpoint.url)}</div>'
         f'<div class="web-col"><span class="web-col-label">Porta</span><span class="metric"><strong>{h(endpoint.port)}</strong>porta</span><span class="metric"><strong>WEB</strong>serviço</span></div>'
-        f'<div class="web-col"><span class="web-col-label">Título</span>{h(title)}</div>'
+        f'<div class="web-col"><span class="web-col-label">Título</span>{web_title_html(endpoint, state, title)}</div>'
         f'<div class="web-col"><span class="web-col-label">Resposta</span><span class="web-meta">{"".join(response_parts)}</span></div>'
         f'<div class="web-col"><span class="web-col-label">Fuzzing</span>{fuzz_tool_buttons(endpoint.url, custom_wordlist=custom_wordlist, thread_count=dashboard_dirsearch_threads(state))}</div>'
         "</div>"
         "</div>"
     )
+
+
+def web_title_html(endpoint: WebEndpoint, state: ScanState, title: str) -> str:
+    favicon = favicon_img_html(endpoint, state)
+    return f'<span class="web-title">{favicon}<span>{h(title)}</span></span>'
+
+
+def favicon_img_html(endpoint: WebEndpoint, state: ScanState) -> str:
+    if not endpoint.favicon_file:
+        return ""
+    candidate = Path(state.output_dir) / endpoint.favicon_file
+    if not candidate.exists():
+        return ""
+    return f'<img class="favicon-img" src="{h(endpoint.favicon_file)}" alt="">'
 
 
 def port_details_list(
@@ -4840,6 +5917,129 @@ def service_group_table(
         )
     rows.append("</tbody></table></div>")
     return "\n".join(rows)
+
+
+def smb_service_group_table(
+    services: list[ServiceRecord],
+    endpoints_by_host_port: dict[tuple[str, int], list[WebEndpoint]],
+    state: ScanState,
+) -> str:
+    """Render SMB service group table with SMBv1, Auth and Shares status columns."""
+    smbv1_status = detect_smbv1_status_from_evidence(state)
+    auth_status = detect_smb_auth_status_from_evidence(state)
+    shares_status = detect_smb_shares_from_evidence(state)
+    rows = [
+        '<div class="table-wrap"><table><thead><tr><th>Host</th><th>Porta</th><th>Serviço</th><th>Produto</th><th>SMBv1</th><th>Auth</th><th>Shares</th><th>Web</th><th>Interação</th></tr></thead><tbody>'
+    ]
+    for service in sorted(services, key=lambda item: (ip_sort_key(item.ip), item.port)):
+        host = state.hosts.get(service.ip, HostRecord(ip=service.ip))
+        hostname = host.hostname or host.fqdn
+        service_endpoints = endpoints_by_host_port.get((service.ip, service.port), [])
+        endpoint_links = " ".join(endpoint.url for endpoint in service_endpoints)
+        endpoint_links_html = web_dropdown_for_service(service_endpoints, state)
+        smbv1_key = (service.ip, service.port)
+        smbv1_enabled = smbv1_status.get(smbv1_key, None)
+        if smbv1_enabled is True:
+            smbv1_html = '<span class="sev-high" style="font-weight:800">⚠ TRUE</span>'
+        elif smbv1_enabled is False:
+            smbv1_html = '<span class="muted">False</span>'
+        else:
+            smbv1_html = '<span class="muted">-</span>'
+        auth_label = auth_status.get(smbv1_key, "")
+        if auth_label:
+            auth_html = f'<span class="sev-medium" style="font-weight:800">✓ {h(auth_label)}</span>'
+        else:
+            auth_html = '<span class="muted">-</span>'
+        shares_found = shares_status.get(smbv1_key, False)
+        if shares_found:
+            shares_anchor = f"shares-{safe_filename(service.ip)}-{service.port}"
+            shares_html = f'<a href="#{h(shares_anchor)}" class="sev-medium" style="font-weight:800">✓ Shares</a>'
+        else:
+            shares_html = '<span class="muted">-</span>'
+        rows.append(
+            f'<tr data-filter="{row_filter(service.ip, hostname, service.port, service.protocol, service.service, service.product, service.version, endpoint_links, "smbv1" if smbv1_enabled else "", auth_label, "shares" if shares_found else "")}" '
+            f'data-service="{h(service.service or service_group_name(service))}">'
+            f'<td><span class="mono">{h(service.ip)}</span><br><span class="muted">{h(hostname)}</span></td>'
+            f'<td class="mono nowrap">{h(service.port)}/{h(service.protocol)}</td>'
+            f"<td>{h(service.service or service_group_name(service))}</td>"
+            f"<td>{h(service_descriptor(service) or '-')}</td>"
+            f"<td>{smbv1_html}</td>"
+            f"<td>{auth_html}</td>"
+            f"<td>{shares_html}</td>"
+            f"<td>{endpoint_links_html}</td>"
+            f"<td>{service_interaction_buttons(service)}</td>"
+            "</tr>"
+        )
+    rows.append("</tbody></table></div>")
+    return "\n".join(rows)
+
+
+def detect_smbv1_status_from_evidence(state: ScanState) -> dict[tuple[str, int], bool]:
+    """Check all SMB evidence to determine SMBv1 status per IP:port."""
+    result: dict[tuple[str, int], bool] = {}
+    for item in state.evidence:
+        if item.category != "smb" or item.port is None:
+            continue
+        key = (item.ip, item.port)
+        # Check evidence data for smbv1_enabled flag
+        if item.data.get("smbv1_enabled") is True:
+            result[key] = True
+            continue
+        # Check description text
+        if "smbv1" in item.description.lower() and ("enabled" in item.description.lower() or "true" in item.description.lower()):
+            result[key] = True
+            continue
+        # Check raw output file for SMBv1 patterns
+        if item.raw_output_file and key not in result:
+            raw_text = raw_file_text(item.raw_output_file, state)
+            if raw_text and detect_smbv1_enabled(raw_text):
+                result[key] = True
+            elif key not in result:
+                result[key] = False
+    return result
+
+
+def detect_smb_auth_status_from_evidence(state: ScanState) -> dict[tuple[str, int], str]:
+    """Return auth status label per SMB IP:port from evidence data."""
+    result: dict[tuple[str, int], str] = {}
+    for item in state.evidence:
+        if item.port is None:
+            continue
+        key = (item.ip, item.port)
+        if key in result:
+            continue
+        # Check for successful auth evidence
+        if item.data.get("auth_result") == "accepted" and item.data.get("protocol") in {"smb", "smb/shares"}:
+            username = item.data.get("username", "")
+            if not username or username in {"", "anonymous", "guest"}:
+                result[key] = "anonymous"
+            else:
+                password = item.data.get("password", "")
+                if password:
+                    result[key] = f"{username}:{password}"
+                else:
+                    result[key] = username
+            continue
+        # Check for anonymous/null session in parsed SMB data
+        if item.category == "smb" and item.data.get("anonymous_or_null_session"):
+            result[key] = "anonymous/null"
+    return result
+
+
+def detect_smb_shares_from_evidence(state: ScanState) -> dict[tuple[str, int], bool]:
+    """Return True per SMB IP:port if shares were discovered."""
+    result: dict[tuple[str, int], bool] = {}
+    for item in state.evidence:
+        if item.category != "smb" or item.port is None:
+            continue
+        key = (item.ip, item.port)
+        if key in result:
+            continue
+        title_lower = item.title.lower()
+        desc_lower = item.description.lower()
+        if "shares" in title_lower and ("visible" in title_lower or "listing" in desc_lower or "share" in desc_lower):
+            result[key] = True
+    return result
 
 
 def web_dropdown_for_service(endpoints: list[WebEndpoint], state: ScanState) -> str:
@@ -4931,9 +6131,11 @@ def enumeration_details_block(evidence: list[Evidence], state: ScanState, title:
     for item in sorted(items, key=lambda entry: (severity_rank(entry.severity), entry.category, entry.port or 0, entry.title)):
         target = item.ip + (f":{item.port}" if item.port else "")
         data_text = evidence_data_text(item)
-        raw = raw_link(item.raw_output_file, state)
-        command_html = command_block_html("Comando", [item.command]) if item.command else ""
+        raw = raw_details_for_evidence(item, state)
         data_html = f'<div class="enum-data">{h(data_text)}</div>' if data_text else ""
+        output_excerpt = item.data.get("output_excerpt", "") if item.data else ""
+        excerpt_html = inline_output_excerpt_html(output_excerpt, item.command or "", target) if output_excerpt else ""
+        command_copy = copy_value_button("Copiar comando", item.command) if item.command else ""
         rows.append(
             '<details class="enum-item">'
             "<summary>"
@@ -4942,14 +6144,215 @@ def enumeration_details_block(evidence: list[Evidence], state: ScanState, title:
             "</summary>"
             '<div class="enum-body">'
             f'<div>{h(item.description)}</div>'
-            f'<div class="web-meta"><span class="pill">{h(item.category)}</span>{raw}</div>'
-            f'{command_html}'
+            f'{command_copy}'
+            f'{excerpt_html}'
+            f'<div class="web-meta"><span class="pill">{h(item.category)}</span></div>'
+            f'{raw}'
             f'{data_html}'
             "</div>"
             "</details>"
         )
     rows.append("</div></details>")
     return "\n".join(rows)
+
+
+def grouped_enumeration_details_block(evidence: list[Evidence], state: ScanState, title: str = "Informações de Enumeração") -> str:
+    items = [
+        item
+        for item in evidence
+        if item.raw_output_file or item.command or item.data or item.description
+    ]
+    if not items:
+        return ""
+    grouped: dict[str, list[Evidence]] = {}
+    for item in items:
+        grouped.setdefault(item.title or item.service or item.category, []).append(item)
+    rows = [
+        '<details class="enum-details">',
+        f'<summary>{h(title)} <span class="metric"><strong>{h(len(grouped))}</strong>grupos</span></summary>',
+        '<div class="enum-list">',
+    ]
+    for group_title, group_items in sorted(grouped.items(), key=lambda entry: (severity_rank(group_severity(entry[1])), entry[0])):
+        sorted_items = sorted(group_items, key=lambda entry: (ip_sort_key(entry.ip), entry.port or 0, entry.category, entry.service))
+        hosts = sorted({item.ip for item in sorted_items}, key=ip_sort_key)
+        ports = sorted({item.port for item in sorted_items if item.port})
+        categories = sorted({item.category for item in sorted_items if item.category})
+        raw = grouped_raw_details(group_title, sorted_items, state)
+        descriptions = grouped_evidence_descriptions(sorted_items)
+        rows.append(
+            '<details class="enum-item">'
+            "<summary>"
+            f'<span><strong>{h(group_title)}</strong><br><span class="muted mono">{h(", ".join(categories) or "-")} · {h(len(hosts))} host(s) · {h(len(ports))} porta(s)</span></span>'
+            f'<span class="metric"><strong>{h(group_severity(sorted_items))}</strong>nível</span>'
+            "</summary>"
+            '<div class="enum-body">'
+            f'{descriptions}'
+            f'{raw}'
+            "</div>"
+            "</details>"
+        )
+    rows.append("</div></details>")
+    return "\n".join(rows)
+
+
+def group_severity(items: list[Evidence]) -> str:
+    if not items:
+        return "info"
+    return sorted({item.severity for item in items}, key=severity_rank)[0]
+
+
+def grouped_evidence_descriptions(items: list[Evidence]) -> str:
+    rows = ['<div class="enum-target-list">']
+    for item in items:
+        target = item.ip + (f":{item.port}" if item.port else "")
+        rows.append(
+            f'<div class="enum-target-row"><span class="mono">{h(target)}</span>'
+            f'<span class="pill sev-{h(item.severity)}">{h(item.severity)}</span>'
+            f'<span>{h(item.description or item.service or item.category)}</span></div>'
+        )
+    rows.append("</div>")
+    return "\n".join(rows)
+
+
+def evidence_matches_service_group(item: Evidence, group_name: str, services: list[ServiceRecord]) -> bool:
+    if item.port is None:
+        return False
+    for service in services:
+        if item.ip == service.ip and item.port == service.port and service_group_name(service) == group_name:
+            return True
+    return False
+
+
+def is_group_enum_noise_evidence(item: Evidence) -> bool:
+    if item.command or item.raw_output_file or item.data:
+        return False
+    if item.category == "exposure":
+        return True
+    title = item.title.lower()
+    description = item.description.lower()
+    exposure_title = any(token in title for token in [" exposed", " open", "service exposed", "port open"])
+    exposure_description = any(token in description for token in ["reachable", "porta aberta", "porta exposta", "service is reachable", "is open"])
+    return exposure_title and exposure_description
+
+
+def raw_details_for_evidence(item: Evidence, state: ScanState) -> str:
+    if not item.raw_output_file:
+        return ""
+    text = raw_file_text(item.raw_output_file, state)
+    if not text:
+        return ""
+    target = item.ip + (f":{item.port}" if item.port else "")
+    return raw_details_html("RAW", text, command=item.command, meta=target)
+
+
+def grouped_raw_details(title: str, items: list[Evidence], state: ScanState) -> str:
+    chunks: list[str] = []
+    seen_raw_files: set[str] = set()
+    for item in items:
+        if not item.raw_output_file or item.raw_output_file in seen_raw_files:
+            continue
+        seen_raw_files.add(item.raw_output_file)
+        text = raw_file_text(item.raw_output_file, state)
+        if not text:
+            continue
+        target = item.ip + (f":{item.port}" if item.port else "")
+        chunks.append(
+            "\n".join(
+                [
+                    f"===== {target} | {item.title} | {item.category} =====",
+                    text.rstrip(),
+                    "",
+                ]
+            )
+        )
+    if not chunks:
+        return ""
+    command_text = evidence_group_command_text(title, items)
+    return raw_details_html("RAW agregado", "\n".join(chunks).rstrip() + "\n", command=command_text, meta=title)
+
+
+def evidence_group_command_text(title: str, items: list[Evidence]) -> str:
+    services = [
+        ServiceRecord(ip=item.ip, port=int(item.port), protocol="tcp", service=item.service or item.category)
+        for item in items
+        if item.port
+    ]
+    tool = evidence_title_tool_label(title)
+    if tool and len(services) > 1:
+        loop_command = service_tool_loop_command(tool, services)
+        if loop_command:
+            return loop_command
+    commands = [item.command for item in items if item.command]
+    return command_text_for_copy(commands, loop_multiple=True)
+
+
+def evidence_title_tool_label(title: str) -> str:
+    normalized = title.lower()
+    if normalized.startswith("nmap "):
+        return "Nmap NSE"
+    mapping = {
+        "nxc rdp": "NXC RDP",
+        "nxc smb": "NXC",
+        "nxc smb shares": "NXC",
+        "nxc ldap": "NXC LDAP",
+        "nxc ftp": "NXC FTP",
+        "nxc mssql": "NXC MSSQL",
+        "nxc winrm": "NXC WinRM",
+        "nxc ssh": "NXC SSH",
+        "nxc mysql": "NXC MySQL",
+        "auth accepted": "Auth",
+        "auth rejected": "Auth",
+        "crackmapexec smb": "CrackMapExec",
+        "smbclient anonymous list": "SMBClient",
+        "rpcclient srvinfo": "RPCClient",
+        "impacket-smbclient shares": "Impacket",
+    }
+    return mapping.get(normalized, "")
+
+
+def raw_details_html(label: str, text: str, command: str = "", meta: str = "") -> str:
+    raw_id = command_dom_id(f"raw:{meta}:{text[:200]}")
+    copy_command = copy_value_button("Copiar comando", command) if command else ""
+    return (
+        '<details class="raw-details">'
+        f'<summary>{h(label)}</summary>'
+        '<div class="raw-body">'
+        f'<div class="raw-toolbar">{copy_command}<span class="muted mono">{h(meta)}</span></div>'
+        f'<textarea id="{h(raw_id)}" class="raw-output" readonly spellcheck="false">{h(text)}</textarea>'
+        "</div>"
+        "</details>"
+    )
+
+
+def inline_output_excerpt_html(output: str, command: str = "", meta: str = "") -> str:
+    """Render a tool's stdout as an inline expandable details block."""
+    if not output or not output.strip():
+        return ""
+    excerpt_id = command_dom_id(f"excerpt:{meta}:{output[:200]}")
+    command_display = f'<div class="muted mono" style="margin-bottom:6px;font-size:11px;word-break:break-all">{h(command)}</div>' if command else ""
+    return (
+        '<details class="raw-details" style="margin-top:8px">'
+        '<summary>Output do comando</summary>'
+        '<div class="raw-body">'
+        f'{command_display}'
+        f'<textarea id="{h(excerpt_id)}" class="raw-output" readonly spellcheck="false" style="max-height:300px">{h(output)}</textarea>'
+        "</div>"
+        "</details>"
+    )
+
+
+def raw_file_text(raw_file: str, state: ScanState) -> str:
+    candidate = Path(state.output_dir) / raw_file
+    try:
+        candidate.resolve().relative_to(Path(state.output_dir).resolve())
+    except ValueError:
+        return ""
+    if not candidate.exists() or not candidate.is_file():
+        return ""
+    try:
+        return candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def evidence_data_text(item: Evidence, limit: int = 6000) -> str:
@@ -5100,8 +6503,8 @@ def format_bytes(value: int) -> str:
     return f"{value} B"
 
 
-def copy_commands_button(label: str, commands: Iterable[str]) -> str:
-    command_text = "\n".join(dedupe_text(commands))
+def copy_commands_button(label: str, commands: Iterable[str], *, loop_multiple: bool = False) -> str:
+    command_text = command_text_for_copy(commands, loop_multiple=loop_multiple)
     if not command_text:
         return ""
     command_id = command_dom_id(command_text)
@@ -5111,6 +6514,20 @@ def copy_commands_button(label: str, commands: Iterable[str]) -> str:
     )
 
 
+def command_text_for_copy(commands: Iterable[str], *, loop_multiple: bool = False) -> str:
+    clean = dedupe_text(commands)
+    if loop_multiple and len(clean) > 1:
+        return shell_for_loop_for_commands(clean)
+    return "\n".join(clean)
+
+
+def shell_for_loop_for_commands(commands: list[str], log_file: str = "birdscan-commands-all.txt") -> str:
+    targets = " ".join(shlex_quote(command) for command in commands)
+    if not targets:
+        return ""
+    return f'for cmd in {targets}; do sh -c "$cmd"; done 2>&1 | tee -a {shlex_quote(log_file)}'
+
+
 def fuzz_tool_buttons(
     url: str,
     custom_wordlist: str = "",
@@ -5118,7 +6535,7 @@ def fuzz_tool_buttons(
     tools: Iterable[str] = FUZZ_DASHBOARD_TOOLS,
 ) -> str:
     by_tool = selected_fuzz_commands_by_tool(url, custom_wordlist=custom_wordlist, thread_count=thread_count, tools=tools)
-    buttons = [copy_commands_button(tool, commands) for tool, commands in by_tool.items()]
+    buttons = [copy_commands_button(tool, commands, loop_multiple=True) for tool, commands in by_tool.items()]
     return '<span class="fuzz-buttons">' + "".join(buttons) + "</span>"
 
 
@@ -5128,11 +6545,16 @@ def global_fuzz_buttons(
     thread_count: int = 1,
     tools: Iterable[str] = FUZZ_DASHBOARD_TOOLS,
 ) -> str:
+    root_urls = root_urls_for_items(items)
+    if len(root_urls) > 1:
+        commands_by_tool = fuzz_loop_commands_by_tool(root_urls, custom_wordlist=custom_wordlist, thread_count=thread_count, tools=tools)
+        buttons = [copy_commands_button(tool, commands) for tool, commands in commands_by_tool.items()]
+        return '<div class="global-fuzz-actions">' + "".join(buttons) + "</div>"
     commands_by_tool: dict[str, list[str]] = {}
-    for root_url in root_urls_for_items(items):
+    for root_url in root_urls:
         for tool, commands in selected_fuzz_commands_by_tool(root_url, custom_wordlist=custom_wordlist, root_only=True, thread_count=thread_count, tools=tools).items():
             commands_by_tool.setdefault(tool, []).extend(commands)
-    buttons = [copy_commands_button(tool, dedupe_text(commands)) for tool, commands in commands_by_tool.items()]
+    buttons = [copy_commands_button(tool, dedupe_text(commands), loop_multiple=True) for tool, commands in commands_by_tool.items()]
     return '<div class="global-fuzz-actions">' + "".join(buttons) + "</div>"
 
 
@@ -5184,14 +6606,62 @@ def selected_fuzz_commands_by_tool(
     }
 
 
+def fuzz_loop_commands_by_tool(
+    urls: Iterable[str],
+    custom_wordlist: str = "",
+    thread_count: int = 1,
+    tools: Iterable[str] = FUZZ_DASHBOARD_TOOLS,
+) -> dict[str, list[str]]:
+    root_urls = root_urls_for_items(urls)
+    if len(root_urls) <= 1:
+        if not root_urls:
+            return {}
+        return selected_fuzz_commands_by_tool(root_urls[0], custom_wordlist=custom_wordlist, root_only=True, thread_count=thread_count, tools=tools)
+    custom_wordlist = custom_wordlist or "/path/to/custom-wordlist.txt"
+    gobuster_wordlist = custom_wordlist if custom_wordlist != "/path/to/custom-wordlist.txt" else DASHBOARD_BIG_WORDLIST
+    thread_count = max(1, int(thread_count))
+    target_values = " ".join(shlex_quote(root_url) for root_url in root_urls)
+    candidates = {
+        "Gobuster": (
+            f'count=0; for url in {target_values}; do count=$((count+1)); '
+            f'gobuster dir -u "$url" -w {shlex_quote(gobuster_wordlist)} -k -t {thread_count} -e --no-error -r '
+            f'-o "fuzz-gobuster-$count.txt" -a Mozilla/5.0 --exclude-length 123456 -x {DASHBOARD_EXTENSIONS_CSV}; '
+            "done 2>&1 | tee -a fuzzing-gobuster-all-web.txt"
+        ),
+        "Feroxbuster": (
+            f'count=0; for url in {target_values}; do count=$((count+1)); '
+            f'feroxbuster --insecure --url "$url" --methods GET,POST -r -A -w {shlex_quote(DASHBOARD_BIG_WORDLIST)} '
+            f'-o "fuzz-feroxbuster-$count.txt" -x {DASHBOARD_EXTENSIONS_SPACE}; '
+            "done 2>&1 | tee -a fuzzing-feroxbuster-all-web.txt"
+        ),
+        "Dirsearch": (
+            f'count=0; for url in {target_values}; do count=$((count+1)); '
+            f'dirsearch -u "$url" --crawl --full-url -t {thread_count} --user-agent Mozilla/5.0 '
+            f'-e {DASHBOARD_EXTENSIONS_CSV} -o "fuzz-dirsearch-$count.txt"; '
+            "done 2>&1 | tee -a fuzzing-dirsearch-all-web.txt"
+        ),
+        "FFUF": (
+            f'count=0; for url in {target_values}; do count=$((count+1)); fuzz_url="${{url%/}}/FUZZ"; '
+            f'ffuf -u "$fuzz_url" -w {shlex_quote(DASHBOARD_BIG_WORDLIST)} -c -t 100 -e {DASHBOARD_EXTENSIONS_DOT} '
+            f'-o "output-$count.html" -of html; '
+            "done 2>&1 | tee -a fuzzing-ffuf-all-web.txt"
+        ),
+        "Dirb": (
+            f'count=0; for url in {target_values}; do count=$((count+1)); '
+            f'dirb "$url" {shlex_quote(DASHBOARD_SECLISTS_BIG_WORDLIST)} -a Mozilla/5.0 -X {DASHBOARD_EXTENSIONS_DOT} '
+            f'-o "dirb-$count.txt"; '
+            "done 2>&1 | tee -a fuzzing-dirb-all-web.txt"
+        ),
+    }
+    allowed = set(tools)
+    return {tool: [command] for tool, command in candidates.items() if tool in allowed}
+
+
 def fuzz_commands_by_tool(url: str, custom_wordlist: str = "", root_only: bool = False, thread_count: int = 1) -> dict[str, list[str]]:
     base_url = normalize_fuzz_root_url(url) if root_only else normalize_fuzz_base_url(url)
     if not base_url:
         return {}
-    parsed_base = urllib.parse.urlparse(base_url)
-    slug = safe_filename(f"{parsed_base.scheme}_{parsed_base.netloc}_{parsed_base.path.strip('/')}")
-    if not slug:
-        slug = "web"
+    slug = fuzz_slug_for_base_url(base_url)
     ffuf_url = base_url.rstrip("/") + "/FUZZ"
     custom_wordlist = custom_wordlist or "/path/to/custom-wordlist.txt"
     gobuster_wordlist = custom_wordlist if custom_wordlist != "/path/to/custom-wordlist.txt" else DASHBOARD_BIG_WORDLIST
@@ -5201,7 +6671,7 @@ def fuzz_commands_by_tool(url: str, custom_wordlist: str = "", root_only: bool =
             f"gobuster dir -u {shlex_quote(base_url)} -w {shlex_quote(gobuster_wordlist)} -k -t {thread_count} -e --no-error -r -o fuzz-gobuster-{slug}.txt -a Mozilla/5.0 --exclude-length 123456 -x {DASHBOARD_EXTENSIONS_CSV}",
         ],
         "Feroxbuster": [
-            f"feroxbuster --url {shlex_quote(base_url)} --methods GET,POST -r -A -w {shlex_quote(DASHBOARD_BIG_WORDLIST)} -o fuzz-feroxbuster-{slug}.txt -x {DASHBOARD_EXTENSIONS_SPACE}",
+            f"feroxbuster --insecure --url {shlex_quote(base_url)} --methods GET,POST -r -A -w {shlex_quote(DASHBOARD_BIG_WORDLIST)} -o fuzz-feroxbuster-{slug}.txt -x {DASHBOARD_EXTENSIONS_SPACE}",
         ],
         "Dirsearch": [
             f"dirsearch -u {shlex_quote(base_url)} --crawl --full-url -t {thread_count} --user-agent Mozilla/5.0 -e {DASHBOARD_EXTENSIONS_CSV} -o fuzz-dirsearch-{slug}.txt",
@@ -5214,12 +6684,20 @@ def fuzz_commands_by_tool(url: str, custom_wordlist: str = "", root_only: bool =
         ],
     }
 
+
+def fuzz_slug_for_base_url(base_url: str) -> str:
+    parsed_base = urllib.parse.urlparse(base_url)
+    slug = safe_filename(f"{parsed_base.scheme}_{parsed_base.netloc}_{parsed_base.path.strip('/')}")
+    return slug or "web"
+
+
 def command_block_html(title: str, commands: list[str], *, open_by_default: bool = False) -> str:
     if not commands:
         return ""
     open_attr = " open" if open_by_default else ""
     rows = [f'<details class="command-details"{open_attr}><summary>{h(title)}</summary><div class="command-list">']
-    for command in commands:
+    display_commands = [command_text_for_copy(commands, loop_multiple=True)] if len(dedupe_text(commands)) > 1 else commands
+    for command in display_commands:
         command_id = command_dom_id(command)
         rows.append(
             '<div class="command-row">'
@@ -5241,6 +6719,10 @@ def command_dom_id(command: str) -> str:
 
 
 def command_tool_name(command: str) -> str:
+    if command.lstrip().startswith("while "):
+        return "loop"
+    if command.lstrip().startswith("for "):
+        return "loop"
     return command.split(" ", 1)[0] if command.strip() else "command"
 
 
@@ -5261,7 +6743,7 @@ def service_interaction_buttons(service: ServiceRecord) -> str:
     buttons: list[str] = []
     if service_group_name(service) == "WEB":
         buttons.append(open_url_button("Abrir", build_url(preferred_scheme_for_service(service), service.ip, service.port, "/")))
-    buttons.extend(copy_commands_button(label, commands) for label, commands in by_tool.items())
+    buttons.extend(copy_commands_button(label, commands, loop_multiple=True) for label, commands in by_tool.items())
     return '<div class="copy-actions">' + "".join(buttons) + "</div>"
 
 
@@ -5269,7 +6751,15 @@ def service_nmap_command(service: ServiceRecord) -> str:
     command = ["nmap"]
     if service.protocol == "udp":
         command.append("-sU")
-    command.extend(["-sV", "-Pn", "-p", str(service.port)])
+    command.extend(["-Pn", "-sV", "--version-all", "--reason", "-p", str(service.port), service.ip])
+    return shell_join(command)
+
+
+def service_nmap_script_command(service: ServiceRecord) -> str:
+    command = ["nmap"]
+    if service.protocol == "udp":
+        command.append("-sU")
+    command.extend(["-Pn", "-sV", "--reason", "-p", str(service.port)])
     scripts = service_nmap_scripts(service)
     if scripts:
         command.extend(["--script", scripts])
@@ -5334,7 +6824,12 @@ def service_primary_commands_by_tool(service: ServiceRecord) -> dict[str, list[s
     port = service.port
     group = service_group_name(service)
     netcat = f"nc -nv {shlex_quote(ip)} {port}"
-    commands: dict[str, list[str]] = {"Nmap": [service_nmap_command(service)]}
+    commands: dict[str, list[str]] = {
+        "Nmap Versão": [service_nmap_command(service)],
+        "Nmap NSE": [service_nmap_script_command(service)],
+    }
+    if service.protocol == "tcp":
+        commands["NetCat"] = [netcat]
     if group == "WEB":
         scheme = preferred_scheme_for_service(service)
         url = build_url(scheme, ip, port, "/")
@@ -5345,11 +6840,11 @@ def service_primary_commands_by_tool(service: ServiceRecord) -> dict[str, list[s
         return commands
     if group == "SMB":
         commands.update({
-            "SMBClient": [f"smbclient -L //{shlex_quote(ip)} -N -g -p {port}"],
+            "SMBClient": [f"smbclient -L //{shlex_quote(ip)} -N -p {port}"],
             "NXC": [f"nxc smb {shlex_quote(ip)} --port {port} --shares"],
             "CrackMapExec": [f"crackmapexec smb {shlex_quote(ip)} --port {port} --shares"],
             "RPCClient": [f"rpcclient -U '' -N {shlex_quote(ip)} -p {port} -c srvinfo"],
-            "Impacket": [f"printf 'shares\\nexit\\n' > smbclient-{safe_filename(ip)}-{port}.cmds && impacket-smbclient -port {port} -no-pass -inputfile smbclient-{safe_filename(ip)}-{port}.cmds {shlex_quote(ip)}"],
+            "Impacket": [f"printf 'shares\\nexit\\n' | impacket-smbclient -port {port} -no-pass {shlex_quote(ip)}"],
         })
         return commands
     if group == "RDP":
@@ -5380,6 +6875,12 @@ def service_primary_commands_by_tool(service: ServiceRecord) -> dict[str, list[s
         return commands
     if group == "KERBEROS":
         commands["KRB5 info"] = [f"nmap -sV -Pn -p {port} --script krb5-info {shlex_quote(ip)}"]
+        realm = "DOMAIN.LOCAL"
+        kerbrute_wordlist = "/usr/share/seclists/Usernames/xato-net-10-million-usernames.txt"
+        bruteuser_wordlist = "/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-1000.txt"
+        commands["Kerbrute userenum"] = [f"kerbrute userenum --dc {shlex_quote(ip)}:{port} -d {realm} {shlex_quote(kerbrute_wordlist)}"]
+        commands["Kerbrute passwordspray"] = [f"kerbrute passwordspray --dc {shlex_quote(ip)}:{port} -d {realm} {shlex_quote(kerbrute_wordlist)} Senha123!"]
+        commands["Impacket GetNPUsers"] = [f"impacket-GetNPUsers {realm}/ -no-pass -usersfile lista-de-user-valido.txt -format hashcat -outputfile hashes-found.txt -dc-ip {shlex_quote(ip)}"]
         return commands
     if group == "DATABASE/DATA":
         service_name = (service.service or "").lower()
@@ -5395,8 +6896,6 @@ def service_primary_commands_by_tool(service: ServiceRecord) -> dict[str, list[s
             commands["Mongo"] = [f"mongosh --host {shlex_quote(ip)} --port {port}"]
         if port in ELASTIC_PORTS or "elastic" in service_name:
             commands["Elastic"] = [f"curl -s {shlex_quote(build_url('http', ip, port, '/_cluster/health?pretty'))}"]
-        if len(commands) == 1:
-            commands["NetCat"] = [netcat]
         return commands
     if group == "WINRM":
         commands.update({
@@ -5609,10 +7108,10 @@ def dependencies_table(deps: dict[str, bool]) -> str:
 def raw_link(raw_file: str, state: ScanState) -> str:
     if not raw_file:
         return '<span class="muted">-</span>'
-    candidate = Path(state.output_dir) / raw_file
-    if not candidate.exists():
+    text = raw_file_text(raw_file, state)
+    if not text:
         return '<span class="muted">-</span>'
-    return f'<a href="{h(raw_file)}" target="_blank" rel="noreferrer">raw</a>'
+    return raw_details_html("RAW", text, meta=raw_file)
 
 
 def print_summary(state: ScanState, report_path: Path, logger: Logger) -> None:
@@ -5691,6 +7190,48 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
 
     ip_port_path = fixture_dir / "ip-port.txt"
     ip_port_path.write_text("10.10.10.50:22\n10.10.10.50:8080/tcp\n", encoding="utf-8")
+    nmap_glob_normal = fixture_dir / "nmap-extra-one.nmap"
+    nmap_glob_normal.write_text(
+        "\n".join(
+            [
+                "Nmap scan report for extra.internal.local (10.10.10.91)",
+                "Host is up (0.001s latency).",
+                "PORT   STATE SERVICE",
+                "81/tcp open  http",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    nmap_glob_xml = fixture_dir / "nmap-extra-two.xml"
+    nmap_glob_xml.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap">
+  <host>
+    <status state="up"/>
+    <address addr="10.10.10.92" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="82"><state state="open"/><service name="http"/></port>
+    </ports>
+  </host>
+</nmaprun>
+""",
+        encoding="utf-8",
+    )
+    nmap_glob_junk = fixture_dir / "nmap-junk.txt"
+    nmap_glob_junk.write_text("not a scan\n", encoding="utf-8")
+    nmap_empty_path = fixture_dir / "nmap-empty-result.nmap"
+    nmap_empty_path.write_text(
+        "\n".join(
+            [
+                "# Nmap 7.99 scan initiated as: nmap -sn -oN empty",
+                "Starting Nmap 7.99 ( https://nmap.org )",
+                "Nmap done: 0 IP addresses (0 hosts up) scanned in 0.01 seconds",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     test_args = argparse.Namespace(**vars(args))
     test_args.output_dir = str(output_dir)
@@ -5701,7 +7242,15 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
     import_nmap_path(normal_path, state, logger)
     import_nmap_path(fixture_dir / "scan-prefix", state, logger)
     import_nmap_path(xml_path, state, logger)
+    empty_import_ok = True
+    try:
+        import_nmap_path(nmap_empty_path, state, logger)
+    except BirdScanUsageError:
+        empty_import_ok = False
     parse_ip_port_file(ip_port_path, state, logger)
+    favicon_path = Path(state.output_dir) / RAW_DIR / "web" / "favicons" / "self-test.ico"
+    favicon_path.parent.mkdir(parents=True, exist_ok=True)
+    favicon_path.write_bytes(b"\x00\x00\x01\x00")
     state.web_endpoints.append(
         WebEndpoint(
             url="http://10.10.10.50:8080/",
@@ -5715,6 +7264,8 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
             technologies=["nginx"],
             interesting=True,
             finding_reason="self-test web endpoint",
+            favicon_url="http://10.10.10.50:8080/favicon.ico",
+            favicon_file=relpath(favicon_path, state.output_dir),
         )
     )
     maybe_add_web_evidence(state.web_endpoints[-1], state)
@@ -5753,6 +7304,7 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
     kerberos_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.40", port=88, service="kerberos"))
     mssql_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.20", port=1444, service="ms-sql-s"))
     winrm_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.70", port=5986, service="wsmans"))
+    generic_nmap_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.93", port=12345, service="unknown"))
     group_action_html = service_group_actions(
         "RDP",
         [
@@ -5760,6 +7312,15 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
             ServiceRecord(ip="10.10.10.31", port=3391, service="ms-wbt-server"),
         ],
     )
+    generic_loop_text = command_text_for_copy(
+        ["nmap -Pn -p 80 10.10.10.10", "nmap -Pn -p 443 10.10.10.10"],
+        loop_multiple=True,
+    )
+    gobuster_loop_command = fuzz_loop_commands_by_tool(
+        ["http://10.10.10.50:8080/", "https://10.10.10.40/"],
+        thread_count=4,
+        tools=("Gobuster",),
+    ).get("Gobuster", [""])[0]
     roots = web_roots_for_services(state.services, state.web_endpoints)
     catalog = web_catalog_endpoints(state.services, state.web_endpoints)
     root_catalog = web_root_catalog_endpoints(state.services, state.web_endpoints)
@@ -5793,6 +7354,151 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
             ]
         )
     )
+    glob_import_paths = resolve_nmap_import_paths(fixture_dir / "nmap*")
+    flattened_nmap_inputs = nmap_import_values(argparse.Namespace(from_nmap=[[str(nmap_glob_normal), str(nmap_glob_xml)]]))
+    redacted_port_command = redact_command(["smbclient", "-L", "//10.10.10.60", "-N", "-g", "-p", "445"], secrets=["secret"])
+    redacted_password_command = redact_command(["nxc", "smb", "10.10.10.60", "-u", "user", "-p", "secret"], secrets=["secret"])
+    group_noise_evidence = Evidence(
+        category="exposure",
+        ip="10.10.10.50",
+        port=22,
+        service="ssh",
+        title="SSH open",
+        description="SSH is reachable.",
+    )
+    group_tool_evidence = Evidence(
+        category="ssh",
+        ip="10.10.10.50",
+        port=22,
+        service="ssh",
+        title="nmap ssh scripts",
+        description="Nmap returned SSH metadata.",
+        raw_output_file="raw/services/ssh/sample.txt",
+    )
+    rdp_raw_dir = Path(state.output_dir) / RAW_DIR / "services" / "rdp"
+    rdp_raw_dir.mkdir(parents=True, exist_ok=True)
+    rdp_raw_one = rdp_raw_dir / "rdp_one.txt"
+    rdp_raw_two = rdp_raw_dir / "rdp_two.txt"
+    rdp_raw_one.write_text("$ nmap -Pn -p 3389 --script rdp-enum-encryption 10.10.10.30\nRDP output one\n", encoding="utf-8")
+    rdp_raw_two.write_text("$ nmap -Pn -p 3391 --script rdp-enum-encryption 10.10.10.31\nRDP output two\n", encoding="utf-8")
+    rdp_group_services = [
+        ServiceRecord(ip="10.10.10.30", port=3389, service="ms-wbt-server"),
+        ServiceRecord(ip="10.10.10.31", port=3391, service="ms-wbt-server"),
+    ]
+    rdp_group_evidence = [
+        Evidence(
+            category="rdp",
+            ip="10.10.10.30",
+            port=3389,
+            service="rdp",
+            title="nmap rdp scripts",
+            description="RDP metadata collected.",
+            command="nmap -Pn -p 3389 --script rdp-enum-encryption 10.10.10.30",
+            raw_output_file=relpath(rdp_raw_one, state.output_dir),
+        ),
+        Evidence(
+            category="rdp",
+            ip="10.10.10.31",
+            port=3391,
+            service="rdp",
+            title="nmap rdp scripts",
+            description="RDP metadata collected.",
+            command="nmap -Pn -p 3391 --script rdp-enum-encryption 10.10.10.31",
+            raw_output_file=relpath(rdp_raw_two, state.output_dir),
+        ),
+        Evidence(
+            category="ad",
+            ip="10.10.10.30",
+            port=None,
+            service="dns",
+            title="Reverse DNS name discovered through AD DNS",
+            description="rdp.internal.local",
+            raw_output_file=relpath(rdp_raw_one, state.output_dir),
+        ),
+    ]
+    rdp_filtered_evidence = [item for item in rdp_group_evidence if evidence_matches_service_group(item, "RDP", rdp_group_services)]
+    rdp_grouped_html = grouped_enumeration_details_block(rdp_filtered_evidence, state, title="Informações de Enumeração do Grupo")
+    rdp_raw_inline_html = raw_details_for_evidence(rdp_group_evidence[0], state)
+    host_only_state = ScanState(run_id="host-only", started_at="", output_dir=str(output_dir))
+    parse_nmap_normal(
+        "\n".join(
+            [
+                "Nmap scan report for ping-only.internal.local (10.10.10.95)",
+                "Host is up (0.001s latency).",
+                "Nmap done: 1 IP address (1 host up) scanned in 0.10 seconds",
+            ]
+        ),
+        host_only_state,
+        "sn-normal",
+    )
+    parse_nmap_gnmap("Host: 10.10.10.96 (gnmap-only.internal.local)\tStatus: Up\n", host_only_state, "sn-gnmap")
+    parse_nmap_xml(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap">
+  <host>
+    <status state="up"/>
+    <address addr="10.10.10.97" addrtype="ipv4"/>
+    <hostnames><hostname name="xml-only.internal.local" type="PTR"/></hostnames>
+  </host>
+</nmaprun>
+""",
+        host_only_state,
+        "sn-xml",
+    )
+    merge_state = ScanState(run_id="merge", started_at="", output_dir=str(output_dir))
+    parse_nmap_normal(
+        "\n".join(
+            [
+                "Nmap scan report for sparse.internal.local (10.10.10.98)",
+                "Host is up (0.001s latency).",
+                "PORT     STATE SERVICE",
+                "8080/tcp open  http-proxy",
+                "",
+            ]
+        ),
+        merge_state,
+        "sparse-normal",
+    )
+    parse_nmap_xml(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap">
+  <host>
+    <status state="up"/>
+    <address addr="10.10.10.98" addrtype="ipv4"/>
+    <hostnames><hostname name="rich.internal.local" type="PTR"/></hostnames>
+    <ports>
+      <port protocol="tcp" portid="8080">
+        <state state="open"/>
+        <service name="http" product="nginx" version="1.28.3" extrainfo="reverse proxy"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+""",
+        merge_state,
+        "rich-xml",
+    )
+    merged_service = merge_state.find_service("10.10.10.98", 8080)
+    known_service = ServiceRecord(ip="10.10.10.99", port=3306, service="mysql", source="sparse")
+    merge_service(known_service, ServiceRecord(ip="10.10.10.99", port=3306, service="unknown", source="weak"))
+
+    users_fixture = fixture_dir / "users.txt"
+    users_fixture.write_text("alice\nbob\n", encoding="utf-8")
+    passwords_fixture = fixture_dir / "passwords.txt"
+    passwords_fixture.write_text("pass1\npass2\n", encoding="utf-8")
+    pitchfork_args = argparse.Namespace(username_file=str(users_fixture), password_file=str(passwords_fixture), username=None, password=None, auth_attack_mode="pitchfork", ntlm_hash=None)
+    pitchfork_pairs, pitchfork_mode = build_credential_pairs(pitchfork_args)
+    cluster_args = argparse.Namespace(username_file=str(users_fixture), password_file=str(passwords_fixture), username=None, password=None, auth_attack_mode="clusterbomb", ntlm_hash=None)
+    cluster_pairs, cluster_mode = build_credential_pairs(cluster_args)
+    single_user_args = argparse.Namespace(username="admin", password=None, username_file=None, password_file=str(passwords_fixture), auth_attack_mode="auto", ntlm_hash=None)
+    single_user_pairs, single_user_mode = build_credential_pairs(single_user_args)
+    single_pass_args = argparse.Namespace(username=None, password="Winter2024!", username_file=str(users_fixture), password_file=None, auth_attack_mode="auto", ntlm_hash=None)
+    single_pass_pairs, single_pass_mode = build_credential_pairs(single_pass_args)
+    order_fixture = fixture_dir / "order-users.txt"
+    order_fixture.write_text("zeta\nalpha\nzeta\n", encoding="utf-8")
+    order_users = collect_credential_usernames(argparse.Namespace(username=None, username_file=str(order_fixture), password=None, password_file=None))
+    pitchfork_uneven_args = argparse.Namespace(username_file=str(order_fixture), password_file=str(passwords_fixture), username=None, password=None, auth_attack_mode="pitchfork", ntlm_hash=None)
+    pitchfork_uneven_pairs, _ = build_credential_pairs(pitchfork_uneven_args)
 
     checks = [
         ("hosts", len(state.hosts) == 5, f"expected 5 hosts, got {len(state.hosts)}"),
@@ -5801,8 +7507,18 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
         ("web-roots-all-web-services", len(roots) == web_service_count and any(root.url == "http://10.10.10.50:8080/" for root in roots), "WEB roots were not generated from all WEB services"),
         ("web-root-priority-sum", len(root_prioritized) + len(root_other) == web_service_count, "prioritized + other WEB roots does not match WEB port count"),
         ("web-catalog-synthetic-roots", len(catalog) >= len(roots) and any(endpoint.status_code == 0 and endpoint.url.startswith("http://10.10.10.40") for endpoint in catalog), "WEB catalog did not include synthetic roots for WEB ports"),
+        ("nmap-glob-import", nmap_glob_normal in glob_import_paths and nmap_glob_xml in glob_import_paths, "Nmap glob import did not resolve nmap* files"),
+        ("nmap-glob-skips-junk", nmap_glob_junk not in glob_import_paths, "Nmap glob import should skip non-Nmap files"),
+        ("nmap-empty-import-nonfatal", empty_import_ok, "valid Nmap output with no useful host/service data should not abort import"),
+        ("nmap-host-only-normal", "10.10.10.95" in host_only_state.hosts and not host_only_state.services, "normal -sn output should import host-only data"),
+        ("nmap-host-only-gnmap", "10.10.10.96" in host_only_state.hosts, "gnmap Status: Up output should import host-only data"),
+        ("nmap-host-only-xml", "10.10.10.97" in host_only_state.hosts, "XML host without ports should import host-only data"),
+        ("nmap-merge-rich-service", merged_service is not None and merged_service.product == "nginx" and "1.28.3" in merged_service.version and "sparse-normal" in merged_service.source and "rich-xml" in merged_service.source, "same IP:port across Nmap files should merge richer service data"),
+        ("nmap-merge-keeps-known-service", known_service.service == "mysql" and "weak" in known_service.source, "unknown service name should not overwrite a useful known service"),
+        ("nmap-multiple-cli-values", flattened_nmap_inputs == [str(nmap_glob_normal), str(nmap_glob_xml)], "multiple --from-nmap values were not flattened"),
         ("deep-fuzz-command", "-w" not in deep_command and "-m" in deep_command and "GET" in deep_command and "-f" in deep_command and DEEP_FUZZ_EXTENSIONS_CSV in deep_command, "deep-fuzz dirsearch command is not correct"),
         ("http-status-any-code-active", has_http_response(not_found_endpoint) and is_reportable_web_endpoint(not_found_endpoint), "HTTP 404 root should be treated as active/reportable"),
+        ("screenshot-404-filter", not is_web_success(not_found_endpoint) and is_reportable_web_endpoint(not_found_endpoint), "HTTP 404 should stay reportable but not be treated as screenshot success"),
         ("active-roots-any-status", len(not_found_roots) == 1 and not_found_roots[0].url == "http://10.10.10.90:9090/", "active WEB roots should include any HTTP status"),
         ("dirsearch-parse-any-status", mixed_dirsearch_results == [(404, "http://10.10.10.90:9090/missing"), (500, "http://10.10.10.90:9090/error")], "dirsearch parser should preserve all HTTP status results"),
         ("non-interesting-no-evidence", len(state.evidence) == evidence_count_before, "non-interesting WEB endpoint generated evidence"),
@@ -5818,20 +7534,29 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
         ("service-tab", 'id="tab-service-groups"' in report_text, "service grouping tab not generated"),
         ("dashboard-fonts", "Urbanist" in report_text and "JetBrains Mono" in report_text, "dashboard font stack not rendered"),
         ("overview-pie-charts", "pie-donut" in report_text and "Serviços por Tipo" in report_text and "Status HTTP" in report_text, "overview pie charts not rendered"),
+        ("overview-domains", "Domínios locais" in report_text and "internal.local" in report_text and report_text.find("Domínios locais") < report_text.find("Hosts catalogados"), "local domains not rendered first in quick map"),
         ("overview-bars", "Host x porta x quantidade" in report_text and "Top 10 serviços expostos" in report_text, "overview bar charts not rendered"),
         ("overview-charts-first", report_text.find("Gráficos de Superfície") < report_text.find("Mapa Rápido"), "overview charts should render before quick map"),
         ("attention-expand", "data-attention-toggle" in attention_test_html and "Mostrar mais" in attention_test_html, "attention list expansion not rendered"),
         ("no-severity-chart", "Evidências por severidade" not in report_text, "legacy severity chart should not be rendered"),
         ("web-service-full-catalog", "Catálogo WEB Completo" in report_text and "http://10.10.10.50:8080/api" in report_text, "WEB service view did not render full WEB catalog"),
+        ("web-title-favicon", "Self Test Login" in report_text and "favicon-img" in report_text and "self-test.ico" in report_text, "WEB title/favicon not rendered"),
         ("enumeration-details", "Informações de Enumeração" in report_text and "enum-details" in report_text, "enumeration details block not rendered"),
-        ("fuzz-commands", "gobuster dir -u http://10.10.10.50:8080/" in report_text and "feroxbuster --url http://10.10.10.50:8080/" in report_text and "dirsearch -u http://10.10.10.50:8080/" in report_text, "web fuzzing commands not generated"),
+        ("fuzz-commands", "gobuster dir -u http://10.10.10.50:8080/" in report_text and "feroxbuster --insecure --url http://10.10.10.50:8080/" in report_text and "dirsearch -u http://10.10.10.50:8080/" in report_text, "web fuzzing commands not generated"),
         ("catalog-status-groups", "Catálogo Web" in report_text and "web-status-group" in report_text, "WEB catalog status groups not rendered"),
         ("open-button", 'target="_blank" rel="noreferrer">Abrir</a>' in report_text, "Open button not rendered"),
         ("web-priority-sections-removed", "Endpoints WEB Priorizados" not in report_text and "Demais Endereços WEB" not in report_text, "WEB priority sections should not be rendered"),
         ("fuzz-ip-expandable", "web-fuzz-ip-section" in report_text and "web-fuzz-ip-row" in report_text, "Fuzzing by IP expandable rows not rendered"),
+        ("redact-keeps-ports", "445" in redacted_port_command and "***" not in redacted_port_command, "redaction should not hide service ports"),
+        ("redact-hides-secret-after-short-p", "***" in redacted_password_command and "secret" not in redacted_password_command, "redaction should hide explicit secrets after -p (if secrets list is provided)"),
+        ("group-enum-noise-filter", is_group_enum_noise_evidence(group_noise_evidence) and not is_group_enum_noise_evidence(group_tool_evidence), "group enumeration should hide exposure-only noise and keep tool evidence"),
+        ("group-enum-service-filter", len(rdp_filtered_evidence) == 2 and not any(item.category == "ad" for item in rdp_filtered_evidence), "service group enumeration should not include unrelated host-level AD/DNS evidence"),
+        ("group-enum-aggregates-title", rdp_grouped_html.count('<details class="enum-item">') == 1 and "RDP output one" in rdp_grouped_html and "RDP output two" in rdp_grouped_html and "RAW agregado" in rdp_grouped_html, "service group enumeration should aggregate outputs by title/tool"),
+        ("group-raw-copy-tool-loop", "for spec in" in rdp_grouped_html and "for cmd in" not in rdp_grouped_html and "birdscan-nmap_nse-all-targets.txt" in rdp_grouped_html, "aggregated RAW copy action should use a tool target loop"),
+        ("raw-inline", "raw-details" in rdp_raw_inline_html and "RDP output one" in rdp_raw_inline_html and "Copiar comando" in rdp_raw_inline_html, "RAW output should render inline with command copy action"),
         ("gobuster-single-command", len(gobuster_commands) == 1, "Gobuster copy button should contain one command"),
         ("ftp-copy-commands", any("ftp -inv -p 10.10.10.50 21" in command for command in ftp_commands.get("FTP anonymous", [])), "FTP anonymous command not generated as expected"),
-        ("smb-port-commands", " -p 139" in " ".join(smb_commands.get("SMBClient", [])) and "--port 139" in " ".join(smb_commands.get("NXC", [])) and "-port 139" in " ".join(smb_commands.get("Impacket", [])), "SMB commands do not carry the detected port"),
+        ("smb-port-commands", " -p 139" in " ".join(smb_commands.get("SMBClient", [])) and "-g" not in " ".join(smb_commands.get("SMBClient", [])) and "--port 139" in " ".join(smb_commands.get("NXC", [])) and "-port 139" in " ".join(smb_commands.get("Impacket", [])), "SMB commands do not carry the detected port or still have -g flag"),
         ("rdp-port-commands", "/v:10.10.10.30:3390" in " ".join(rdp_commands.get("XFreeRDP", [])) and "--port 3390" in " ".join(rdp_commands.get("NXC RDP", [])), "RDP commands do not carry the detected port"),
         ("ssh-port-command", "ssh -p 2222" in " ".join(ssh_commands.get("SSH", [])), "SSH command does not carry the detected port"),
         ("ldap-port-command", "ldaps://10.10.10.40:636" in " ".join(ldap_commands.get("LDAPSearch", [])) and "--port 636" in " ".join(ldap_commands.get("NXC LDAP", [])), "LDAP commands do not carry the detected port"),
@@ -5839,12 +7564,36 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
         ("mssql-port-command", "-port 1444" in " ".join(mssql_commands.get("MSSQL", [])) and "--port 1444" in " ".join(mssql_commands.get("MSSQL", [])), "MSSQL commands do not carry the detected port"),
         ("winrm-port-command", "-P 5986" in " ".join(winrm_commands.get("Evil-WinRM", [])) and "--port 5986" in " ".join(winrm_commands.get("NXC WinRM", [])), "WinRM commands do not carry the detected port"),
         ("group-actions-all-services", "10.10.10.30:3390" in group_action_html and "10.10.10.31:3391" in group_action_html and "XFreeRDP" in group_action_html, "service group actions do not include commands for every host:port"),
+        ("generic-command-loop", "for cmd in" in generic_loop_text and 'sh -c "$cmd"' in generic_loop_text and "tee -a birdscan-commands-all.txt" in generic_loop_text and "echo" not in generic_loop_text, "multiple commands should be copied as a clean shell for-loop without echo decorations"),
+        ("service-group-command-loop", "for spec in" in group_action_html and "for cmd in" not in group_action_html and 'nxc rdp &quot;$ip&quot; --port &quot;$port&quot;' in group_action_html and "tee -a birdscan-nxc_rdp-all-targets.txt" in group_action_html and 'echo' not in service_tool_loop_command("NXC RDP", rdp_group_services), "service group multi-target commands should render as clean tool target loops"),
+        ("service-group-loop-no-bad-bracket-pattern", '${ip#[}' not in group_action_html and '[ &quot;$proto&quot;' not in group_action_html, "service group loop should not render shell patterns that break on '['"),
+        ("copy-ips-action", "Copiar IPs" in group_action_html and "10.10.10.30\n10.10.10.31" in group_action_html, "service group should include copy-only-IPs action"),
+        ("gobuster-url-loop", "for url in" in gobuster_loop_command and 'gobuster dir -u "$url"' in gobuster_loop_command and gobuster_loop_command.count("gobuster dir -u") == 1 and "tee -a fuzzing-gobuster-all-web.txt" in gobuster_loop_command and "http://10.10.10.50:8080/" in gobuster_loop_command and "https://10.10.10.40/" in gobuster_loop_command and "echo" not in gobuster_loop_command, "global Gobuster command should loop over WEB roots without echo decorations"),
+        ("fuzz-loop-simple-counter", "sed " not in gobuster_loop_command and "$slug" not in gobuster_loop_command and "count=$((count+1))" in gobuster_loop_command, "global fuzzing loop should use a simple counter instead of slug parsing"),
+        ("generic-nmap-version-command", "--version-all" in " ".join(generic_nmap_commands.get("Nmap Versão", [])) and "--reason" in " ".join(generic_nmap_commands.get("Nmap Versão", [])) and "Nmap NSE" in generic_nmap_commands, "generic service analysis commands not rendered"),
         ("bytes-label", endpoint_size_label(WebEndpoint(url="http://x/", ip="x", port=80, scheme="http", response_size=1234)) == "1234 bytes", "endpoint size label is not bytes"),
         ("dirsearch-parse", parse_dirsearch_results("[00:00:00] 200 - 123B - http://10.10.10.50:8080/admin") == [(200, "http://10.10.10.50:8080/admin")], "dirsearch parser did not extract URL/status"),
         ("json", (Path(state.output_dir) / "results.json").exists(), "results.json not generated"),
         ("csv", (Path(state.output_dir) / "services.csv").exists(), "services.csv not generated"),
         ("markdown", (Path(state.output_dir) / "summary.md").exists(), "summary.md not generated"),
         ("raw-copy", bool(list((Path(state.output_dir) / RAW_DIR / "nmap" / "imported").glob("*"))), "imported Nmap files not preserved"),
+        ("auth-pitchfork-pairs", pitchfork_mode == "pitchfork" and pitchfork_pairs == [CredentialPair("alice", "pass1"), CredentialPair("bob", "pass2")], "pitchfork credential pairing failed"),
+        ("auth-clusterbomb-pairs", cluster_mode == "clusterbomb" and len(cluster_pairs) == 4, "clusterbomb credential pairing failed"),
+        ("auth-single-user-pairs", single_user_mode == "single-user" and single_user_pairs == [CredentialPair("admin", "pass1"), CredentialPair("admin", "pass2")], "single-user credential pairing failed"),
+        ("auth-single-pass-pairs", single_pass_mode == "single-pass" and single_pass_pairs == [CredentialPair("alice", "Winter2024!"), CredentialPair("bob", "Winter2024!")], "single-pass credential pairing failed"),
+        ("auth-list-order-preserved", order_users == ["zeta", "alpha", "zeta"], "credential list order or duplicates were modified"),
+        ("auth-pitchfork-uneven-pairs", pitchfork_uneven_pairs == [CredentialPair("zeta", "pass1"), CredentialPair("alpha", "pass2")], "pitchfork should stop at the shorter list without modifying input order"),
+        ("nxc-auth-success-parse", nxc_auth_success("SMB 10.0.0.1 445 HOST [-] user bad\nSMB 10.0.0.1 445 HOST [+] user:pass") and not nxc_auth_success("SMB 10.0.0.1 445 HOST [-] user bad"), "nxc auth success parser failed"),
+        ("smbv1-detect-nxc", detect_smbv1_enabled("SMB 10.0.0.1 445 HOST SMBv1:True"), "detect_smbv1_enabled should detect nxc SMBv1:True"),
+        ("smbv1-detect-nmap", detect_smbv1_enabled("smb-protocols:\n  NT LM 0.12\n  2.0.2\n  3.0.2"), "detect_smbv1_enabled should detect NT LM 0.12 dialect"),
+        ("smbv1-detect-false", not detect_smbv1_enabled("SMB 10.0.0.1 445 HOST SMBv1:False signing:True"), "detect_smbv1_enabled should return False when SMBv1 is disabled"),
+        ("smbv1-parse-keywords", parse_smb_keywords("SMBv1:True signing: false")["smbv1_enabled"] is True and parse_smb_keywords("SMBv1:True signing: false")["severity"] == "high", "parse_smb_keywords should flag SMBv1 as high severity"),
+        ("impacket-no-inputfile", all("-inputfile" not in cmd for cmd in smb_commands.get("Impacket", [])) and "printf" in " ".join(smb_commands.get("Impacket", [])) and "|" in " ".join(smb_commands.get("Impacket", [])), "Impacket copy command should use pipe instead of inputfile"),
+        ("kerbrute-in-deps", "kerbrute" in DEPENDENCIES, "kerbrute should be in DEPENDENCIES list"),
+        ("kerbrute-kerberos-commands", "Kerbrute userenum" in kerberos_commands and "kerbrute userenum" in " ".join(kerberos_commands.get("Kerbrute userenum", [])), "Kerberos commands should include kerbrute userenum"),
+        ("kerbrute-passwordspray-commands", "Kerbrute passwordspray" in kerberos_commands and "kerbrute passwordspray" in " ".join(kerberos_commands.get("Kerbrute passwordspray", [])), "Kerberos commands should include kerbrute passwordspray"),
+        ("kerbrute-parse-valid", parse_kerbrute_results("2024/01/01 12:00:00 >  [+] VALID USERNAME:  admin@DOMAIN.LOCAL")["valid_users"] == ["admin"], "kerbrute parser should extract valid usernames"),
+        ("kerbrute-parse-empty", not parse_kerbrute_results("2024/01/01 12:00:00 >  [-] invalid@DOMAIN.LOCAL"), "kerbrute parser should return empty for no valid users"),
     ]
     failures = [f"{name}: {detail}" for name, passed, detail in checks if not passed]
     if failures:
@@ -5879,7 +7628,18 @@ def main(argv: list[str]) -> int:
                 "web_common_limit": args.web_common_limit if args.web_common_limit is not None else WEB_COMMON_LIMITS.get(args.profile, 120),
                 "web_custom_limit": args.web_custom_limit,
                 "proxy_enabled": bool(args.proxy),
-                "authenticated_enum": bool(args.username or args.password or args.ntlm_hash or args.kerberos),
+                "authenticated_enum": bool(
+                    args.username
+                    or args.password
+                    or args.ntlm_hash
+                    or args.kerberos
+                    or args.username_file
+                    or args.password_file
+                ),
+                "username_file": args.username_file or "",
+                "password_file": args.password_file or "",
+                "auth_attack_mode": getattr(args, "auth_attack_mode", "pitchfork") or "pitchfork",
+                "credential_lists_execute_automated_spray": has_automated_credential_spray(args),
                 "user_enum_enabled": bool(args.enable_user_enum),
             }
         )
@@ -5896,7 +7656,7 @@ def main(argv: list[str]) -> int:
         if args.check_deps and not (targets or args.from_nmap or args.from_ip_port or args.resume):
             save_state(state)
             return 0
-        for nmap_file in args.from_nmap or []:
+        for nmap_file in nmap_import_values(args):
             import_nmap_path(Path(nmap_file), state, logger)
         for ip_port_file in args.from_ip_port or []:
             parse_ip_port_file(Path(ip_port_file), state, logger)
