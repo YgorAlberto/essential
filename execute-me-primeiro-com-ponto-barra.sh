@@ -176,14 +176,14 @@ fi
 python3 -m pip install --upgrade pip $PIP_OPTS 2>/dev/null || python3 -m pip install --upgrade pip --user
 
 PYTHON_PACKAGES=(
-    requests
-    dnspython
-    cryptography
-    ipwhois
-    playwright
-    selenium
-    webdriver-manager
-    Pillow
+    requests --break-system-packages
+    dnspython --break-system-packages
+    cryptography --break-system-packages
+    ipwhois --break-system-packages
+    playwright --break-system-packages
+    selenium --break-system-packages
+    webdriver-manager --break-system-packages
+    Pillow --break-system-packages
 )
 
 python3 -m pip install $PIP_OPTS "${PYTHON_PACKAGES[@]}" 2>/dev/null || \
