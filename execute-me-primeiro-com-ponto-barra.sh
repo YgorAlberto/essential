@@ -173,21 +173,21 @@ if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)" 2>/
     PIP_OPTS="--break-system-packages"
 fi
 
-python3 -m pip install --upgrade pip $PIP_OPTS 2>/dev/null || python3 -m pip install --upgrade pip --user
+python3 -m pip install --upgrade pip $PIP_OPTS --break-system-packages 2>/dev/null || python3 -m pip install --upgrade pip --user --break-system-packages
 
 PYTHON_PACKAGES=(
-    requests --break-system-packages
-    dnspython --break-system-packages
-    cryptography --break-system-packages
-    ipwhois --break-system-packages
-    playwright --break-system-packages
-    selenium --break-system-packages
-    webdriver-manager --break-system-packages
-    Pillow --break-system-packages
+    requests
+    dnspython
+    cryptography
+    ipwhois
+    playwright
+    selenium
+    webdriver-manager
+    Pillow
 )
 
-python3 -m pip install $PIP_OPTS "${PYTHON_PACKAGES[@]}" 2>/dev/null || \
-python3 -m pip install --user "${PYTHON_PACKAGES[@]}"
+python3 -m pip install $PIP_OPTS "${PYTHON_PACKAGES[@]}" --break-system-packages 2>/dev/null || \
+python3 -m pip install --user "${PYTHON_PACKAGES[@]}" --break-system-packages
 
 echo -e "${GREEN}[✓]${NC} Pacotes Python instalados: ${PYTHON_PACKAGES[*]}"
 
