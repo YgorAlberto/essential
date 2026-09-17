@@ -3,12 +3,12 @@
 
 set -u
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 REFRESH_SECONDS="${SENTINEL_REFRESH:-20}"
 MAX_ROWS="${SENTINEL_ROWS:-0}"
 CONNECTION_FILTER=""
 NETWORK_INTERFACES="wlan0,eth0"
-PING_TARGET="${SENTINEL_PING_TARGET:-1.1.1.1}"
+DNS_TEST_HOST="${SENTINEL_DNS_TEST_HOST:-google.com}"
 CUSTOM_COMMAND="${SENTINEL_COMMAND:-htop}"
 TMP_DIR=""
 TMUX_SOCKET=""
@@ -19,8 +19,10 @@ PANEL_ORDER=(resources persistence connections command)
 ACTIVE_PANEL=0
 MISSING_TOOLS=()
 NEED_CORE=0; NEED_AWK=0; NEED_SED=0; NEED_GREP=0; NEED_FIND=0
-NEED_PROCPS=0; NEED_TPUT=0; NEED_NETWORK=0; NEED_PING=0; NEED_HTTP=0
+NEED_PROCPS=0; NEED_TPUT=0; NEED_NETWORK=0; NEED_DNS=0; NEED_HTTP=0
 NEED_TMUX=0; NEED_HTOP=0
+DNS_RESULT_IP=""
+DNS_RESULT_MS=""
 
 # Palette (disabled automatically when stdout is not a terminal or NO_COLOR is set).
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -56,25 +58,25 @@ Uso: ${0##*/} [opções]
            exemplo: -f firefox,mega,antigravity
   -n LISTA interfaces de rede, separadas por vírgula (padrão: wlan0,eth0)
            exemplo: -n wlp2s0,enp3s0
-  -p ALVO  host/IP do ping usado na média (padrão: 1.1.1.1)
+  -d NOME  nome usado no teste de resolução DNS (padrão: example.com)
   -c CMD   comando exibido no quarto quadro (padrão: htop)
            exemplo: -c 'df -h'
   -h       ajuda
 
-Variáveis: SENTINEL_REFRESH, SENTINEL_ROWS, SENTINEL_PING_TARGET,
+Variáveis: SENTINEL_REFRESH, SENTINEL_ROWS, SENTINEL_DNS_TEST_HOST,
            SENTINEL_COMMAND, NO_COLOR
 A coleta padrão é somente leitura; -c executa o texto informado pelo usuário.
 Linux + Bash 4 ou superior.
 EOF
 }
 
-while getopts ":i:r:f:n:p:c:h" opt; do
+while getopts ":i:r:f:n:d:p:c:h" opt; do
   case "$opt" in
     i) REFRESH_SECONDS="$OPTARG" ;;
     r) MAX_ROWS="$OPTARG" ;;
     f) CONNECTION_FILTER="$OPTARG" ;;
     n) NETWORK_INTERFACES="$OPTARG" ;;
-    p) PING_TARGET="$OPTARG" ;;
+    d|p) DNS_TEST_HOST="$OPTARG" ;;
     c) CUSTOM_COMMAND="$OPTARG" ;;
     h) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
@@ -84,8 +86,8 @@ done
 refresh_whole="${REFRESH_SECONDS%%.*}"
 ((10#$refresh_whole >= 20)) || { echo "O intervalo mínimo é 20 segundos" >&2; exit 2; }
 [[ "$MAX_ROWS" =~ ^[0-9]+$ ]] || { echo "Número de linhas inválido" >&2; exit 2; }
-[[ -n "$PING_TARGET" && "$PING_TARGET" != -* && "$PING_TARGET" =~ ^[[:alnum:].:_%-]+$ ]] || {
-  echo "Alvo de ping inválido" >&2; exit 2;
+[[ -n "$DNS_TEST_HOST" && "$DNS_TEST_HOST" != -* && "$DNS_TEST_HOST" =~ ^[[:alnum:]_.-]+$ ]] || {
+  echo "Nome para teste DNS inválido" >&2; exit 2;
 }
 [[ -n "$CUSTOM_COMMAND" && "$CUSTOM_COMMAND" != *$'\n'* ]] || { echo "Comando inválido" >&2; exit 2; }
 [[ ${BASH_VERSINFO[0]} -ge 4 ]] || { echo "Requer Bash 4+" >&2; exit 1; }
@@ -95,7 +97,7 @@ scan_dependencies() {
   local tool command_name
   MISSING_TOOLS=()
   NEED_CORE=0; NEED_AWK=0; NEED_SED=0; NEED_GREP=0; NEED_FIND=0
-  NEED_PROCPS=0; NEED_TPUT=0; NEED_NETWORK=0; NEED_PING=0; NEED_HTTP=0
+  NEED_PROCPS=0; NEED_TPUT=0; NEED_NETWORK=0; NEED_DNS=0; NEED_HTTP=0
   NEED_TMUX=0; NEED_HTOP=0
 
   for tool in sort head cut paste who date getconf df readlink tr timeout tail sleep mktemp rm; do
@@ -116,7 +118,7 @@ scan_dependencies() {
   if ! command -v ip >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
     MISSING_TOOLS+=(ip/ss); NEED_NETWORK=1
   fi
-  command -v ping >/dev/null 2>&1 || { MISSING_TOOLS+=(ping); NEED_PING=1; }
+  command -v getent >/dev/null 2>&1 || { MISSING_TOOLS+=(getent); NEED_DNS=1; }
   if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     MISSING_TOOLS+=(curl/wget); NEED_HTTP=1
   fi
@@ -188,7 +190,7 @@ install_missing_dependencies() {
       ((NEED_PROCPS)) && packages+=(procps)
       ((NEED_TPUT)) && packages+=(ncurses-bin)
       ((NEED_NETWORK)) && packages+=(iproute2)
-      ((NEED_PING)) && packages+=(iputils-ping)
+      ((NEED_DNS)) && packages+=(libc-bin)
       ((NEED_HTTP)) && packages+=(curl)
       ((NEED_TMUX)) && packages+=(tmux)
       ((NEED_HTOP)) && packages+=(htop)
@@ -205,7 +207,7 @@ install_missing_dependencies() {
       ((NEED_PROCPS)) && packages+=(procps-ng)
       ((NEED_TPUT)) && packages+=(ncurses)
       ((NEED_NETWORK)) && packages+=(iproute)
-      ((NEED_PING)) && packages+=(iputils)
+      ((NEED_DNS)) && packages+=(glibc-common)
       ((NEED_HTTP)) && packages+=(curl)
       ((NEED_TMUX)) && packages+=(tmux)
       ((NEED_HTOP)) && packages+=(htop)
@@ -221,7 +223,7 @@ install_missing_dependencies() {
       ((NEED_PROCPS)) && packages+=(procps-ng)
       ((NEED_TPUT)) && packages+=(ncurses)
       ((NEED_NETWORK)) && packages+=(iproute2)
-      ((NEED_PING)) && packages+=(iputils)
+      ((NEED_DNS)) && packages+=(glibc)
       ((NEED_HTTP)) && packages+=(curl)
       ((NEED_TMUX)) && packages+=(tmux)
       ((NEED_HTOP)) && packages+=(htop)
@@ -237,7 +239,7 @@ install_missing_dependencies() {
       ((NEED_PROCPS)) && packages+=(procps)
       ((NEED_TPUT)) && packages+=(ncurses-utils)
       ((NEED_NETWORK)) && packages+=(iproute2)
-      ((NEED_PING)) && packages+=(iputils)
+      ((NEED_DNS)) && packages+=(glibc)
       ((NEED_HTTP)) && packages+=(curl)
       ((NEED_TMUX)) && packages+=(tmux)
       ((NEED_HTOP)) && packages+=(htop)
@@ -253,7 +255,7 @@ install_missing_dependencies() {
       ((NEED_PROCPS)) && packages+=(procps)
       ((NEED_TPUT)) && packages+=(ncurses)
       ((NEED_NETWORK)) && packages+=(iproute2)
-      ((NEED_PING)) && packages+=(iputils)
+      ((NEED_DNS)) && packages+=(musl-utils)
       ((NEED_HTTP)) && packages+=(curl)
       ((NEED_TMUX)) && packages+=(tmux)
       ((NEED_HTOP)) && packages+=(htop)
@@ -298,20 +300,6 @@ temperature_badge() {
   elif awk -v n="$numeric" -v limit="$critical" 'BEGIN {exit !(n>=limit)}'; then
     printf '%s●%s %s' "$RED" "$RESET" "$value"
   elif awk -v n="$numeric" -v limit="$warning" 'BEGIN {exit !(n>=limit)}'; then
-    printf '%s●%s %s' "$YELLOW" "$RESET" "$value"
-  else
-    printf '%s●%s %s' "$GREEN" "$RESET" "$value"
-  fi
-}
-
-ping_badge() {
-  local value="$1" numeric
-  numeric="${value% ms}"
-  if [[ ! "$numeric" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-    printf '%s○%s %s' "$RED" "$RESET" "$value"
-  elif awk -v n="$numeric" 'BEGIN {exit !(n>=150)}'; then
-    printf '%s●%s %s' "$RED" "$RESET" "$value"
-  elif awk -v n="$numeric" 'BEGIN {exit !(n>=80)}'; then
     printf '%s●%s %s' "$YELLOW" "$RESET" "$value"
   else
     printf '%s●%s %s' "$GREEN" "$RESET" "$value"
@@ -443,19 +431,42 @@ detect_fans() {
   fi
 }
 
-ping_average() {
-  local output average
-  if ! command -v ping >/dev/null 2>&1; then
-    printf 'ping indisponível'
+resolve_test_name() {
+  local output started finished elapsed
+  DNS_RESULT_IP=""; DNS_RESULT_MS=""
+  started=$(date +%s%3N 2>/dev/null || printf '0')
+  output=$(LC_ALL=C timeout 5s getent hosts "$DNS_TEST_HOST" 2>/dev/null || true)
+  finished=$(date +%s%3N 2>/dev/null || printf '0')
+  DNS_RESULT_IP=$(awk 'NR==1 {print $1; exit}' <<< "$output")
+  if [[ "$started" =~ ^[0-9]+$ && "$finished" =~ ^[0-9]+$ ]]; then
+    elapsed=$((finished-started)); ((elapsed<0)) && elapsed=0
+    DNS_RESULT_MS="$elapsed"
+  fi
+}
+
+detect_primary_dns() {
+  local directive address configured="" direct="" resolved=""
+  if [[ -r /etc/resolv.conf ]]; then
+    while read -r directive address _; do
+      [[ "$directive" == nameserver && -n "${address:-}" ]] || continue
+      [[ -z "$configured" ]] && configured="$address"
+      if [[ "$address" != 127.* && "$address" != ::1 ]]; then
+        direct="$address"; break
+      fi
+    done < /etc/resolv.conf
+  fi
+  if [[ -n "$direct" ]]; then
+    printf '%s' "$direct"
     return
   fi
-  if command -v timeout >/dev/null 2>&1; then
-    output=$(LC_ALL=C timeout 5s ping -n -c 3 -W 1 "$PING_TARGET" 2>/dev/null || true)
-  else
-    output=$(LC_ALL=C ping -n -c 3 -W 1 "$PING_TARGET" 2>/dev/null || true)
+  if command -v resolvectl >/dev/null 2>&1; then
+    resolved=$(resolvectl dns 2>/dev/null | awk '
+      {
+        for(i=2;i<=NF;i++)
+          if($i ~ /^[0-9a-fA-F:.]+$/ && $i ~ /[.:]/ && $i !~ /^127\./ && $i != "::1") {print $i; exit}
+      }')
   fi
-  average=$(awk -F' = ' '/^(rtt|round-trip)/ {split($2,v,"/"); print v[2]; exit}' <<< "$output")
-  [[ "$average" =~ ^[0-9]+([.][0-9]+)?$ ]] && printf '%s ms' "$average" || printf 'sem resposta'
+  printf '%s' "${resolved:-${configured:-não detectado}}"
 }
 
 print_storage_summary() {
@@ -474,18 +485,19 @@ print_storage_summary() {
     printf 'Nenhum disco físico ou remoto relevante detectado.\n'
     return
   fi
+  printf '%-10s %4s %-8s %-11s %s\n' 'MONTAGEM' 'USO' 'OCUPAÇÃO' 'CAP/LIVRE' 'DISPOSITIVO'
   while read -r source type size used available use_pct mount; do
     [[ -n "${source:-}" ]] || continue
     pct="${use_pct%\%}"
     [[ "$pct" =~ ^[0-9]+$ ]] || continue
-    printf '%-12s %3s ' "$(clip "$mount" 12)" "$use_pct"
+    printf '%-10s %4s ' "$(clip "$mount" 10)" "$use_pct"
     storage_bar "$use_pct"
-    printf '  %s/%s  %s (%s)\n' "$used" "$size" "$source" "$type"
+    printf '  %s/%s  %s (%s)\n' "$size" "$available" "$source" "$type"
   done <<< "$rows"
 }
 
 collect_network() {
-  local public_ip="" iface private_ip gateway
+  local public_ip="" iface private_ip gateway primary_dns
   local -a requested_interfaces
   if command -v curl >/dev/null 2>&1; then
     public_ip=$(curl -4 -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)
@@ -493,6 +505,7 @@ collect_network() {
     public_ip=$(wget -4 -qO- --timeout=3 https://api.ipify.org 2>/dev/null || true)
   fi
   [[ "$public_ip" =~ ^[0-9a-fA-F:.]+$ ]] || public_ip="indisponível/offline"
+  primary_dns=$(detect_primary_dns)
   {
     printf '\n%s── REDE ──%s\n' "$BLUE" "$RESET"
     printf 'PUBLIC IP  %s\n' "$public_ip"
@@ -510,12 +523,13 @@ collect_network() {
       gateway=$(ip -4 route show default dev "$iface" 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
       printf '%-10s IP %-18s GW %s\n' "$iface" "${private_ip:-sem IPv4}" "${gateway:-sem gateway}"
     done
+    printf 'DNS PRINCIPAL  %s\n' "$primary_dns"
   } > "$TMP_DIR/network"
 }
 
 collect_resources() {
   local load mem_total mem_avail mem_used mem_pct swap_total swap_free swap_pct uptime_s top_snapshot
-  local cpu_temperature gpu_temperature fans ping_latency
+  local cpu_temperature gpu_temperature fans
   load=$(awk '{print $1" "$2" "$3}' /proc/loadavg)
   read -r mem_total mem_avail swap_total swap_free < <(awk '
     /MemTotal/ {mt=$2} /MemAvailable/ {ma=$2} /SwapTotal/ {st=$2} /SwapFree/ {sf=$2}
@@ -528,13 +542,21 @@ collect_resources() {
   cpu_temperature=$(detect_cpu_temperature)
   gpu_temperature=$(detect_gpu_temperature)
   fans=$(detect_fans)
-  ping_latency=$(ping_average)
+  resolve_test_name
   {
     printf 'LOAD  %s    CPU cores: %s\n' "$load" "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo '?')"
     printf 'RAM   %3d%% ' "$mem_pct"; bar "$mem_pct" 18; printf '  %d / %d MiB\n' "$((mem_used/1024))" "$((mem_total/1024))"
     printf 'SWAP  %3d%% ' "$swap_pct"; bar "$swap_pct" 18; printf '  uptime %dd %02dh %02dm\n' "$((uptime_s/86400))" "$((uptime_s%86400/3600))" "$((uptime_s%3600/60))"
     [[ -r "$TMP_DIR/network" ]] && sed -n '1,$p' "$TMP_DIR/network"
-    printf 'PING AVG   '; ping_badge "$ping_latency"; printf '  alvo=%s\n' "$PING_TARGET"
+    if [[ -n "$DNS_RESULT_IP" ]]; then
+      printf 'DNS TEST   %s●%s %s → %s' "$GREEN" "$RESET" "$DNS_TEST_HOST" "$DNS_RESULT_IP"
+      [[ -n "$DNS_RESULT_MS" ]] && printf '  %s ms' "$DNS_RESULT_MS"
+      printf '\n'
+    else
+      printf 'DNS TEST   %s○%s %s → falha na resolução' "$RED" "$RESET" "$DNS_TEST_HOST"
+      [[ -n "$DNS_RESULT_MS" ]] && printf '  %s ms' "$DNS_RESULT_MS"
+      printf '\n'
+    fi
     printf '\n%s── TOP 3 CPU + RAM ──%s\n' "$MAGENTA" "$RESET"
     awk '
       {score=$3+$4; printf "%s\t%-6s %-9s CPU %5s%% RAM %5s%% %s\n",score,$1,$2,$3,$4,$5}' |
