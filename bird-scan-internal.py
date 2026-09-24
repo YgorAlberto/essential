@@ -621,9 +621,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
               sudo nmap --open -Pn -p- -sC -sV --script vuln -oA <prefix> <targets>
 
             Examples:
-              python3 Bird-Scan-internal.py --target 192.168.1.10
-              python3 Bird-Scan-internal.py --target 192.168.1.0/24 --profile safe
-              python3 Bird-Scan-internal.py --targets-file targets.txt --threads-level 3
+              # 1️⃣ Re‑test NTLM hash (partial) – skip discovery phases
+              python3 Bird-Scan-internal.py --from-nmap outputs/20260923-114721-2072c9b9/raw/nmap/imported/nmap-sv-local-LAN.nmap --username "john.doe" --ntlm-hash "8846f7ea" --skip-web --skip-service-enum --no-sudo-nmap
+              # 2️⃣ Re‑test NTLM full hash (LM+NTLM) – skip discovery phases
+              python3 Bird-Scan-internal.py --from-nmap outputs/20260923-114721-2072c9b9/raw/nmap/imported/nmap-sv-local-LAN.nmap --username "john.doe" --ntlm-hash "aad3b435b51404eeaad3b435b51404ee:8846f7ea" --no-sudo-nmap
+              # 3️⃣ Full scan with NTLM hash (deep profile, max threads)
+              python3 Bird-Scan-internal.py --target 192.168.1.0/24 --profile deep --threads-level 5 --username "john.doe" --ntlm-hash "aad3b435b51404eeaad3b435b51404ee:8846f7ea" --no-sudo-nmap
+              # 4️⃣ Full scan with password (deep profile, max threads)
+              python3 Bird-Scan-internal.py --target 192.168.1.0/24 --profile deep --threads-level 5 --username "john.doe" --password "S3cr3tP@ss!" --no-sudo-nmap
+              # 5️⃣ Import Nmap and test NTLM hash authentication
+              python3 Bird-Scan-internal.py --from-nmap nmap-sv-local-LAN --username "john.doe" --ntlm-hash "8846f7ea" --no-sudo-nmap
+              # 6️⃣ Import Nmap and test password authentication
+              python3 Bird-Scan-internal.py --from-nmap nmap-sv-local-LAN --username "john.doe" --password "S3cr3tP@ss!" --no-sudo-nmap
               python3 Bird-Scan-internal.py --from-nmap scan.xml --skip-nmap
               python3 Bird-Scan-internal.py --from-nmap scan1.nmap scan2.xml --skip-nmap
               python3 Bird-Scan-internal.py --from-nmap 'scans/nmap*' --skip-nmap
@@ -637,18 +646,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
               python3 Bird-Scan-internal.py --target 10.10.10.0/24 --no-sudo-nmap
               python3 Bird-Scan-internal.py --check-deps
               python3 Bird-Scan-internal.py --self-test
+              python3 Bird-Scan-internal.py --target 10.10.10.0/24 --deep-fuzz
+              python3 Bird-Scan-internal.py --target 10.10.10.0/24 --no-sudo-nmap
+              python3 Bird-Scan-internal.py --check-deps
+              python3 Bird-Scan-internal.py --self-test
             """
         ),
     )
     target_group = parser.add_argument_group("targets")
-    target_group.add_argument("--target", "-t", action="append", help="IP, CIDR, hostname, or comma-separated list.")
+    target_group.add_argument("--target", "-t", action="append", help="IP, CIDR, hostname, comma-separated list, or an exact Nmap command (e.g. 'sudo nmap -sV -p- -oN scan.nmap 10.0.0.1').")
     target_group.add_argument("--targets-file", help="File with IPs, CIDRs, hostnames, or comma-separated values.")
     target_group.add_argument("--from-nmap", action="append", nargs="+", help="Import one or more Nmap XML, normal, gnmap outputs, directories, prefixes, or glob patterns.")
     target_group.add_argument("--from-ip-port", action="append", help="Import simple IP:PORT or host:port file.")
 
     scan_group = parser.add_argument_group("scan behavior")
-    scan_group.add_argument("--profile", choices=sorted(PROFILE_DEFAULTS), default="safe", help="Operational profile.")
-    scan_group.add_argument("--threads-level", type=int, choices=sorted(THREAD_LEVELS), default=2, help="Global aggressiveness 1..5.")
+    scan_group.add_argument("--profile", choices=sorted(PROFILE_DEFAULTS), default="deep", help="Operational profile.")
+    scan_group.add_argument("--threads-level", type=int, choices=sorted(THREAD_LEVELS), default=5, help="Global aggressiveness 1..5.")
     scan_group.add_argument("--ports", help="Nmap ports, e.g. 80,443,445 or 1-1000. Overrides the default -p-.") 
     scan_group.add_argument("--full-portscan", action="store_true", help="Keep -p- during Nmap discovery. This is already the default.")
     scan_group.add_argument("--udp-top-ports", type=int, default=0, help="Optional UDP discovery with top N UDP ports. Disabled by default.")
@@ -680,7 +693,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     auth_group = parser.add_argument_group("optional credentials")
     auth_group.add_argument("--username", "-u", help="Single username for authenticated enumeration.")
     auth_group.add_argument("--password", "-p", help="Single password for authenticated enumeration.")
-    auth_group.add_argument("--ntlm-hash", help="Single NTLM hash for authenticated enumeration.")
+    auth_group.add_argument("--ntlm-hash", help="Single NTLM hash for authenticated enumeration (e.g. LM:NTLM format like 00000000000000000000000000000000:8846F7EAEE8FB117AD06BDD830B7586C, or just the NTLM part depending on the tool).")
+    auth_group.add_argument("--ntlm-hash-file", help="NTLM hash list for authenticated enumeration across auth-capable services.")
     auth_group.add_argument("--username-file", help="Username list for authenticated enumeration across auth-capable services.")
     auth_group.add_argument("--password-file", help="Password list for authenticated enumeration across auth-capable services.")
     auth_group.add_argument(
@@ -787,6 +801,8 @@ def validate_cli_file_paths(args: argparse.Namespace) -> None:
         raise BirdScanUsageError(f"Lista de usuários inválida ou inexistente: {args.username_file}")
     if getattr(args, "password_file", None) and not Path(args.password_file).is_file():
         raise BirdScanUsageError(f"Lista de senhas inválida ou inexistente: {args.password_file}")
+    if getattr(args, "ntlm_hash_file", None) and not Path(args.ntlm_hash_file).is_file():
+        raise BirdScanUsageError(f"Lista de hashes inválida ou inexistente: {args.ntlm_hash_file}")
     validate_credential_attack_args(args)
 
 
@@ -795,9 +811,10 @@ def validate_credential_attack_args(args: argparse.Namespace) -> None:
     if mode in {"single-user", "single-pass"}:
         users = collect_credential_usernames(args)
         passwords = collect_credential_passwords(args)
-        if not users or not passwords:
+        hashes = collect_credential_hashes(args)
+        if not users or (not passwords and not hashes):
             raise BirdScanUsageError(
-                f"Modo {mode} exige ao menos um usuário e uma senha via -u/-p ou arquivos de lista."
+                f"Modo {mode} exige ao menos um usuário e uma senha/hash via -u/-p/--ntlm-hash ou arquivos de lista."
             )
 
 
@@ -1048,8 +1065,8 @@ def check_dependencies(state: ScanState, logger: Logger) -> dict[str, bool]:
     missing = [tool for tool, present in deps.items() if not present]
     logger.info("Dependency check:")
     for tool, present in deps.items():
-        marker = "OK" if present else "missing"
-        logger.info(f"  {tool}: {marker}")
+        if not present:
+            logger.info(f"  {tool}: missing")
     if missing:
         logger.warn("Missing optional/required tools: " + ", ".join(missing))
     return deps
@@ -1062,13 +1079,34 @@ def install_missing_dependencies(state: ScanState, deps: dict[str, bool], logger
     if not has_tool("apt-get"):
         logger.warn("apt-get não encontrado; não foi possível instalar dependências automaticamente.")
         return deps
-    packages = sorted({DEPENDENCY_PACKAGES.get(tool, tool) for tool in missing_tools})
+    
+    packages = sorted(list({DEPENDENCY_PACKAGES.get(tool, tool) for tool in missing_tools}))
+
+    # Se gowitness estiver faltando, vamos precisar de go
+    needs_go = "gowitness" in missing_tools and not has_tool("go")
+    # Se dirsearch estiver faltando, talvez precisaremos de pip
+    needs_pip = "dirsearch" in missing_tools and not has_tool("pip3")
+    # Se mongosh estiver faltando, precisamos do wget
+    needs_wget = "mongosh" in missing_tools and not has_tool("wget")
+
+    if "kerbrute" in missing_tools:
+        needs_wget = True
+
+    if needs_go:
+        packages.append("golang-go")
+    if needs_pip:
+        packages.extend(["python3-pip", "python3-venv", "pipx"])
+    if needs_wget:
+        packages.append("wget")
+
     command: list[str] = []
+    use_sudo = False
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         if not has_tool("sudo"):
-            logger.warn("sudo não encontrado; não foi possível instalar dependências automaticamente.")
-            return deps
-        command.append("sudo")
+            logger.warn("sudo não encontrado; instalações que exigem root podem falhar.")
+        else:
+            command.append("sudo")
+            use_sudo = True
     command.extend(["apt-get", "update"])
     raw_dir = Path(state.output_dir) / RAW_DIR / "dependencies"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -1080,18 +1118,68 @@ def install_missing_dependencies(state: ScanState, deps: dict[str, bool], logger
         logger=logger,
     )
     if update_result.returncode != 0:
-        logger.warn("apt-get update falhou; mantendo dependências ausentes sem instalação automática.")
-        return deps
-    install_command = command[:-1] + ["install", "-y", *packages]
-    logger.info("Installing missing tools: " + ", ".join(packages))
-    install_result = run_command(
-        install_command,
-        timeout=3600,
-        output_file=raw_dir / "apt-install.command.txt",
-        logger=logger,
-    )
-    if install_result.returncode != 0:
-        logger.warn("apt-get install falhou; algumas ferramentas podem continuar ausentes.")
+        logger.warn("apt-get update falhou; prosseguindo com cache antigo e métodos alternativos (pip/wget).")
+    # Install packages one by one to avoid total failure on single missing package
+    logger.info("Installing via APT: " + ", ".join(packages))
+    for pkg in packages:
+        install_result = run_command(
+            command[:-1] + ["install", "-y", pkg],
+            timeout=300,
+            output_file=raw_dir / f"apt-install-{pkg}.command.txt",
+            logger=logger,
+        )
+        if install_result.returncode != 0:
+            logger.warn(f"apt-get install {pkg} falhou; pacote pode não existir no repositório.")
+
+    sudo_prefix = ["sudo"] if use_sudo else []
+
+    # Instalação customizada: Kerbrute via GitHub Release
+    if "kerbrute" in missing_tools and has_tool("wget"):
+        logger.info("Installing Kerbrute via GitHub Release...")
+        cmd = (
+            "wget -qO /tmp/kerbrute https://github.com/ropnop/kerbrute/releases/latest/download/kerbrute_linux_amd64 && "
+            "chmod +x /tmp/kerbrute && "
+            + ("sudo " if use_sudo else "") + "mv /tmp/kerbrute /usr/local/bin/kerbrute"
+        )
+        run_command(["sh", "-c", cmd], timeout=300, logger=logger)
+
+    # Instalação customizada: Gowitness via Go
+    if "gowitness" in missing_tools and has_tool("go"):
+        logger.info("Installing Gowitness via Go...")
+        go_env_result = run_command(["go", "env", "GOPATH"], timeout=10, logger=logger)
+        gopath = go_env_result.stdout.strip() or f"{os.environ.get('HOME', '/root')}/go"
+        run_command(["go", "install", "github.com/sensepost/gowitness@latest"], timeout=600, logger=logger)
+        go_bin = Path(gopath) / "bin" / "gowitness"
+        if go_bin.exists():
+            run_command(sudo_prefix + ["ln", "-sf", str(go_bin), "/usr/local/bin/gowitness"], timeout=10, logger=logger)
+
+    # Instalação customizada: Dirsearch via pip3 fallback
+    if "dirsearch" in missing_tools and not has_tool("dirsearch"):
+        if has_tool("pipx"):
+            logger.info("Installing Dirsearch via pipx...")
+            run_command(["pipx", "install", "dirsearch"], timeout=300, logger=logger)
+            run_command(sudo_prefix + ["pipx", "ensurepath"], timeout=30, logger=logger)
+        elif has_tool("pip3"):
+            logger.info("Installing Dirsearch via pip3...")
+            run_command(["pip3", "install", "dirsearch", "--break-system-packages"], timeout=300, logger=logger)
+
+    # Instalação customizada: Mongosh standalone Debian/Ubuntu
+    if "mongosh" in missing_tools and not has_tool("mongosh") and has_tool("wget"):
+        logger.info("Installing Mongosh via official MongoDB repo...")
+        # Adicionar chave GPG e Repositório MongoDB 7.0 e instalar
+        setup_cmds = [
+            sudo_prefix + ["apt-get", "install", "-y", "gnupg"],
+            ["wget", "-qO-", "https://pgp.mongodb.com/server-7.0.asc"],
+        ]
+        # Devido a complexidade de pipes, usamos sh -c para a chave e repo
+        gpg_cmd = "wget -qO- https://pgp.mongodb.com/server-7.0.asc | " + ("sudo " if use_sudo else "") + "gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg --yes"
+        repo_cmd = "echo 'deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse' | " + ("sudo " if use_sudo else "") + "tee /etc/apt/sources.list.d/mongodb-org-7.0.list"
+        
+        run_command(["sh", "-c", gpg_cmd], timeout=60, logger=logger)
+        run_command(["sh", "-c", repo_cmd], timeout=30, logger=logger)
+        run_command(sudo_prefix + ["apt-get", "update"], timeout=300, logger=logger)
+        run_command(sudo_prefix + ["apt-get", "install", "-y", "mongodb-mongosh"], timeout=300, logger=logger)
+
     return check_dependencies(state, logger)
 
 
@@ -1271,19 +1359,22 @@ def store_imported_nmap_file(path: Path, state: ScanState, logger: Logger) -> Pa
     return target
 
 
-def parse_nmap_file(path: Path, state: ScanState, logger: Logger) -> None:
+def parse_nmap_file(path: Path, state: ScanState, logger: Logger) -> bool:
+    """Parse an Nmap output file. Returns True if parsing succeeded."""
     if not path.exists():
         raise BirdScanError(f"Nmap file not found: {path}")
     text = path.read_text(encoding="utf-8", errors="replace")
     if looks_like_xml(text):
         logger.info(f"Importing Nmap XML from {path}")
-        parse_nmap_xml(text, state, source=path.name, raw_file=relpath(path, state.output_dir))
+        if not parse_nmap_xml(text, state, source=path.name, raw_file=relpath(path, state.output_dir), logger=logger):
+            return False
     elif looks_like_gnmap(text):
         logger.info(f"Importing Nmap greppable data from {path}")
         parse_nmap_gnmap(text, state, source=path.name)
     else:
         logger.info(f"Importing Nmap normal output from {path}")
         parse_nmap_normal(text, state, source=path.name)
+    return True
 
 
 def looks_like_xml(text: str) -> bool:
@@ -1298,11 +1389,14 @@ def looks_like_gnmap(text: str) -> bool:
     return False
 
 
-def parse_nmap_xml(text: str, state: ScanState, source: str, raw_file: str = "") -> None:
+def parse_nmap_xml(text: str, state: ScanState, source: str, raw_file: str = "", logger: Logger | None = None) -> bool:
+    """Parse Nmap XML. Returns True on success, False on parse error."""
     try:
         root = ET.fromstring(text)
     except ET.ParseError as exc:
-        raise BirdScanUsageError(f"XML Nmap inválido: {exc}") from exc
+        if logger:
+            logger.warn(f"XML Nmap malformado (possivelmente truncado): {exc}; tentando outros formatos")
+        return False
     for host in root.findall("host"):
         status = host.find("status")
         if status is not None and status.attrib.get("state") not in {None, "up"}:
@@ -1382,7 +1476,7 @@ def parse_nmap_xml(text: str, state: ScanState, source: str, raw_file: str = "")
         if hostscript is not None:
             for script in hostscript.findall("script"):
                 add_nmap_script_evidence(state, address, None, "host", script, source, raw_file)
-
+    return True
 
 def add_nmap_script_evidence(
     state: ScanState,
@@ -1715,7 +1809,24 @@ def run_nmap_discovery(args: argparse.Namespace, state: ScanState, targets: list
         logger.warn("Nmap is not installed or not in PATH; skipping discovery")
         return
     output_prefix = Path(state.output_dir) / RAW_DIR / "nmap" / "discovery"
-    command = build_nmap_command(args, targets, output_prefix)
+    is_custom_command = False
+    if len(targets) == 1 and targets[0].strip().startswith(("nmap ", "sudo nmap ")):
+        is_custom_command = True
+        custom_command_str = targets[0].strip()
+        logger.info(f"Custom Nmap command detected: {custom_command_str}")
+        import shlex
+        import re
+        command = shlex.split(custom_command_str)
+        match = re.search(r'-o[NXGA]\s+([^\s]+)', custom_command_str)
+        if match:
+            extracted_prefix = match.group(1)
+            output_prefix = Path(extracted_prefix)
+            if output_prefix.suffix in {".nmap", ".xml", ".gnmap"}:
+                output_prefix = output_prefix.with_suffix("")
+        else:
+            logger.warn("No -oN, -oX, -oG, or -oA flag found in custom Nmap command. Output parsing may fail.")
+    else:
+        command = build_nmap_command(args, targets, output_prefix)
     logger.info("Running Nmap discovery")
     timeout = nmap_timeout_for_targets(targets, args)
     result = run_command(
@@ -1725,15 +1836,25 @@ def run_nmap_discovery(args: argparse.Namespace, state: ScanState, targets: list
         logger=logger,
         secrets=[args.password or "", args.ntlm_hash or ""],
     )
-    if result.returncode not in {0, 1}:
+    if result.returncode != 0:
         logger.warn(f"Nmap returned code {result.returncode}; attempting to parse whatever was written")
+        if result.returncode == 1 and "sudo" in (result.stderr or "").lower():
+            logger.warn("Sudo may have failed. Try --no-sudo-nmap or ensure passwordless sudo for nmap.")
     xml_path = output_prefix.with_suffix(".xml")
     normal_path = output_prefix.with_suffix(".nmap")
     gnmap_path = output_prefix.with_suffix(".gnmap")
+    parsed = False
     for candidate in [xml_path, normal_path, gnmap_path]:
         if candidate.exists() and candidate.stat().st_size > 0:
-            parse_nmap_file(candidate, state, logger)
-            break
+            if parse_nmap_file(candidate, state, logger):
+                parsed = True
+                break
+    if not parsed:
+        any_file = any(c.exists() and c.stat().st_size > 0 for c in [xml_path, normal_path, gnmap_path])
+        if not any_file:
+            logger.warn("Nmap produced no output files. Check if nmap is installed and has permissions (try --no-sudo-nmap).")
+        else:
+            logger.warn("All Nmap output files were malformed. Results may be incomplete.")
     if args.udp_top_ports:
         udp_prefix = Path(state.output_dir) / RAW_DIR / "nmap" / "udp-discovery"
         udp_command = build_udp_nmap_command(args, targets, udp_prefix)
@@ -1745,12 +1866,12 @@ def run_nmap_discovery(args: argparse.Namespace, state: ScanState, targets: list
             logger=logger,
             secrets=[args.password or "", args.ntlm_hash or ""],
         )
-        if udp_result.returncode not in {0, 1}:
+        if udp_result.returncode != 0:
             logger.warn(f"UDP Nmap returned code {udp_result.returncode}; attempting to parse whatever was written")
         for candidate in [udp_prefix.with_suffix(".xml"), udp_prefix.with_suffix(".nmap"), udp_prefix.with_suffix(".gnmap")]:
             if candidate.exists() and candidate.stat().st_size > 0:
-                parse_nmap_file(candidate, state, logger)
-                break
+                if parse_nmap_file(candidate, state, logger):
+                    break
     save_state(state)
 
 
@@ -2262,13 +2383,9 @@ def probe_web_endpoint(
     if args.proxy:
         command.extend(["--proxy", args.proxy])
     command.append(url)
-    
-    # User requested a 3s wait to allow complete data to load (best effort for curl/servers)
-    time.sleep(3)
-    
     result = run_command(
         command,
-        timeout=timeout + 3,
+        timeout=timeout,
         output_file=meta_file,
         logger=logger,
         secrets=[args.password or "", args.ntlm_hash or ""],
@@ -2463,8 +2580,7 @@ def fetch_favicon(
             command.extend(["--proxy", args.proxy])
         command.append(favicon_url)
         
-        time.sleep(3)
-        result = run_command(command, timeout=timeout + 3, output_file=meta_file, logger=logger)
+        result = run_command(command, timeout=timeout, output_file=meta_file, logger=logger)
         meta = parse_curl_meta(result.stdout)
         status_code = int(meta.get("status_code", 0) or 0)
         content_type = str(meta.get("content_type", ""))
@@ -2707,7 +2823,8 @@ def run_service_enumeration(args: argparse.Namespace, state: ScanState, logger: 
     run_generic_service_enum(args, state, logger)
     run_kerberos_user_enum_if_enabled(args, state, logger)
     run_kerbrute_user_enum(args, state, logger)
-    run_credential_auth_enumeration(args, state, logger)
+    # NOTE: credential auth enumeration is now called separately in main()
+    # so it always runs when credentials are supplied, even with --skip-service-enum.
     save_state(state)
 
 
@@ -2777,25 +2894,31 @@ def unique_ips_for_ports(state: ScanState, ports: set[int]) -> list[str]:
     return sorted({service.ip for service in services_by_ports(state, ports, {"tcp"})})
 
 
-def credential_args(args: argparse.Namespace, tool: str = "nxc") -> tuple[list[str], list[str]]:
+def credential_args(args: argparse.Namespace, tool: str = "nxc", domain: str = "") -> tuple[list[str], list[str]]:
     command_args: list[str] = []
     secrets: list[str] = []
-    if args.domain:
+    eff_domain = domain if domain is not None else getattr(args, "domain", "")
+    if not domain and getattr(args, "domain", "") and "," not in getattr(args, "domain", ""):
+        eff_domain = getattr(args, "domain", "")
+        
+    if eff_domain:
         if tool in {"nxc", "crackmapexec"}:
-            command_args.extend(["-d", args.domain])
+            command_args.extend(["-d", eff_domain])
         else:
-            command_args.append(args.domain)
+            command_args.append(eff_domain)
     if args.username:
         if tool in {"nxc", "crackmapexec"}:
             command_args.extend(["-u", args.username])
         else:
             command_args.append(args.username)
     if args.password:
+        secrets.append(args.password)
         if tool in {"nxc", "crackmapexec"}:
             command_args.extend(["-p", args.password])
         else:
             command_args.append(args.password)
     if args.ntlm_hash:
+        secrets.append(args.ntlm_hash)
         if tool in {"nxc", "crackmapexec"}:
             command_args.extend(["-H", args.ntlm_hash])
         else:
@@ -2809,9 +2932,11 @@ def credential_args(args: argparse.Namespace, tool: str = "nxc") -> tuple[list[s
 class CredentialPair:
     username: str
     password: str
+    is_hash: bool = False
+    domain: str = ""
 
 
-def load_credential_list_file(path: str | None) -> list[str]:
+def load_credential_list_file(path: str | None, *, strip_inline_comments: bool = True) -> list[str]:
     if not path:
         return []
     file_path = Path(path)
@@ -2822,11 +2947,18 @@ def load_credential_list_file(path: str | None) -> list[str]:
         token = line.strip()
         if not token or token.startswith("#"):
             continue
-        if "#" in token:
+        if strip_inline_comments and "#" in token:
             token = token.split("#", 1)[0].strip()
         if token:
             entries.append(token)
     return entries
+
+
+def collect_domains(args: argparse.Namespace) -> list[str]:
+    domain_arg = getattr(args, "domain", "")
+    if not domain_arg:
+        return [""]
+    return [d.strip() for d in domain_arg.split(",") if d.strip()] or [""]
 
 
 def collect_credential_usernames(args: argparse.Namespace) -> list[str]:
@@ -2841,8 +2973,16 @@ def collect_credential_passwords(args: argparse.Namespace) -> list[str]:
     passwords: list[str] = []
     if args.password:
         passwords.append(args.password)
-    passwords.extend(load_credential_list_file(getattr(args, "password_file", None)))
+    passwords.extend(load_credential_list_file(getattr(args, "password_file", None), strip_inline_comments=False))
     return passwords
+
+
+def collect_credential_hashes(args: argparse.Namespace) -> list[str]:
+    hashes: list[str] = []
+    if args.ntlm_hash:
+        hashes.append(args.ntlm_hash)
+    hashes.extend(load_credential_list_file(getattr(args, "ntlm_hash_file", None), strip_inline_comments=False))
+    return hashes
 
 
 def resolve_auth_attack_mode(args: argparse.Namespace) -> str:
@@ -2851,9 +2991,10 @@ def resolve_auth_attack_mode(args: argparse.Namespace) -> str:
         return mode
     has_user_file = bool(getattr(args, "username_file", None))
     has_pass_file = bool(getattr(args, "password_file", None))
+    has_hash_file = bool(getattr(args, "ntlm_hash_file", None))
     users = collect_credential_usernames(args)
-    passwords = collect_credential_passwords(args)
-    if has_user_file and has_pass_file:
+    passwords = collect_credential_passwords(args) or collect_credential_hashes(args)
+    if has_user_file and (has_pass_file or has_hash_file):
         return "clusterbomb"
     if args.username and has_pass_file:
         return "single-user"
@@ -2874,28 +3015,39 @@ def build_credential_pairs(args: argparse.Namespace) -> tuple[list[CredentialPai
     mode = resolve_auth_attack_mode(args)
     users = collect_credential_usernames(args)
     passwords = collect_credential_passwords(args)
-    if args.ntlm_hash and not passwords:
-        if not users:
-            users = [""]
-        return [CredentialPair(user, "") for user in users], mode
-    if not users or not passwords:
+    hashes = collect_credential_hashes(args)
+    domains = collect_domains(args)
+
+    # Build combined list: first password-based pairs, then hash-based pairs.
+    # Both are tested when both --password/--password-file and --ntlm-hash/--ntlm-hash-file are supplied.
+    combined: list[tuple[str, bool]] = [(p, False) for p in passwords] + [(h, True) for h in hashes]
+    if not combined:
+        return [], mode
+    if not users:
+        users = [""]
+
+    if not users:
         return [], mode
     pairs: list[CredentialPair] = []
     if mode == "pitchfork":
-        for username, password in zip(users, passwords):
-            pairs.append(CredentialPair(username, password))
+        for domain in domains:
+            for username, (secret, is_hash) in zip(users, combined):
+                pairs.append(CredentialPair(username, secret, is_hash, domain))
     elif mode == "clusterbomb":
-        for username in users:
-            for password in passwords:
-                pairs.append(CredentialPair(username, password))
+        for domain in domains:
+            for username in users:
+                for secret, is_hash in combined:
+                    pairs.append(CredentialPair(username, secret, is_hash, domain))
     elif mode == "single-user":
         username = users[0]
-        for password in passwords:
-            pairs.append(CredentialPair(username, password))
+        for domain in domains:
+            for secret, is_hash in combined:
+                pairs.append(CredentialPair(username, secret, is_hash, domain))
     elif mode == "single-pass":
-        password = passwords[0]
-        for username in users:
-            pairs.append(CredentialPair(username, password))
+        secret, is_hash = combined[0]
+        for domain in domains:
+            for username in users:
+                pairs.append(CredentialPair(username, secret, is_hash, domain))
     return pairs, mode
 
 
@@ -2910,31 +3062,34 @@ def credential_args_for_attempt(
     *,
     username: str = "",
     password: str = "",
+    is_hash: bool = False,
+    domain: str = "",
 ) -> tuple[list[str], list[str]]:
     command_args: list[str] = []
     secrets: list[str] = []
-    if args.domain:
+    eff_domain = domain if domain else ""
+    if not eff_domain and getattr(args, "domain", "") and "," not in getattr(args, "domain", ""):
+        eff_domain = getattr(args, "domain", "")
+    if eff_domain:
         if tool in {"nxc", "crackmapexec"}:
-            command_args.extend(["-d", args.domain])
+            command_args.extend(["-d", eff_domain])
         else:
-            command_args.append(args.domain)
+            command_args.append(eff_domain)
     if username:
         if tool in {"nxc", "crackmapexec"}:
             command_args.extend(["-u", username])
         else:
             command_args.append(username)
+    elif getattr(args, "ntlm_hash", None) and tool in {"nxc", "crackmapexec"}:
+        # NXC requires -u even with -H; use empty string
+        command_args.extend(["-u", ""])
+        
     if password:
         secrets.append(password)
         if tool in {"nxc", "crackmapexec"}:
-            command_args.extend(["-p", password])
+            command_args.extend(["-H" if is_hash else "-p", password])
         else:
             command_args.append(password)
-    if args.ntlm_hash:
-        secrets.append(args.ntlm_hash)
-        if tool in {"nxc", "crackmapexec"}:
-            command_args.extend(["-H", args.ntlm_hash])
-        else:
-            command_args.append(args.ntlm_hash)
     if args.kerberos and tool in {"nxc", "crackmapexec"}:
         command_args.append("-k")
     return command_args, secrets
@@ -2974,7 +3129,7 @@ def record_auth_attempt_evidence(
     if not success:
         return
     username_display = pair.username or "(anonymous)"
-    password_display = f":{pair.password}" if pair.password else ""
+    password_display = f":{pair.password}" if pair.password and not pair.is_hash else ""
     title_display = f"{username_display}{password_display}"
     
     # Inject PGPASSWORD into command visually if needed
@@ -3004,7 +3159,8 @@ def record_auth_attempt_evidence(
                 "auth_mode": mode,
                 "auth_method": auth_method,
                 "username": pair.username,
-                "password": pair.password,
+                "password": pair.password if not pair.is_hash else "",
+                "ntlm_hash": pair.password if (uses_hash or pair.is_hash) else "",
                 "protocol": protocol,
                 "tool": tool,
                 "output_excerpt": transcript[:4000],
@@ -3073,7 +3229,7 @@ def run_nxc_auth_attempt(
     mode: str,
     uses_hash: bool,
 ) -> None:
-    cred_args, secrets = credential_args_for_attempt(args, "nxc", username=pair.username, password=pair.password)
+    cred_args, secrets = credential_args_for_attempt(args, "nxc", username=pair.username, password=pair.password, is_hash=pair.is_hash, domain=pair.domain)
     if not cred_args and not uses_hash:
         return
     command = ["nxc", protocol, service.ip, "--port", str(service.port)] + cred_args
@@ -3107,7 +3263,7 @@ def run_crackmapexec_auth_attempt(
     mode: str,
     uses_hash: bool,
 ) -> None:
-    cred_args, secrets = credential_args_for_attempt(args, "crackmapexec", username=pair.username, password=pair.password)
+    cred_args, secrets = credential_args_for_attempt(args, "crackmapexec", username=pair.username, password=pair.password, is_hash=pair.is_hash, domain=pair.domain)
     if not cred_args and not uses_hash:
         return
     command = ["crackmapexec", "smb", service.ip, "--port", str(service.port)] + cred_args
@@ -3192,7 +3348,7 @@ def run_postgres_auth_attempt(
 
 def run_credential_auth_enumeration(args: argparse.Namespace, state: ScanState, logger: Logger) -> None:
     pairs, mode = build_credential_pairs(args)
-    uses_hash = bool(args.ntlm_hash and not collect_credential_passwords(args))
+    uses_hash = pairs and pairs[0].is_hash
     if not pairs:
         return
     users = collect_credential_usernames(args)
@@ -3214,6 +3370,9 @@ def run_credential_auth_enumeration(args: argparse.Namespace, state: ScanState, 
     for service in services:
         for pair in pairs:
             for protocol, tool in auth_protocols_for_service(service):
+                # Skip non-NTLM-capable tools when using hash-only auth
+                if uses_hash and tool in {"psql"} or (uses_hash and tool == "native" and protocol == "ftp"):
+                    continue
                 if tool == "nxc":
                     run_nxc_auth_attempt(args, state, logger, raw_dir, service, protocol, pair, mode, uses_hash)
                 elif tool == "crackmapexec":
@@ -3248,21 +3407,25 @@ def run_smb_ad_enum(args: argparse.Namespace, state: ScanState, logger: Logger) 
         ip = service.ip
         port = service.port
         if has_tool("nxc"):
-            cred_args, secrets = credential_args(args, "nxc")
-            command = ["nxc", "smb", ip, "--port", str(port)] + cred_args
-            result = run_service_command(command, raw_dir / f"nxc_smb_{safe_filename(ip)}_{port}{suffix}.txt", args, logger, secrets)
-            add_tool_evidence(state, "smb", ip, port, "nxc smb", result, parse_smb_keywords(result.stdout + result.stderr))
-            update_host_from_smb_text(state, ip, result.stdout + result.stderr)
-            if args.username or args.password or args.ntlm_hash:
-                shares_command = ["nxc", "smb", ip, "--port", str(port)] + cred_args + ["--shares"]
-                shares_result = run_service_command(shares_command, raw_dir / f"nxc_smb_shares_{safe_filename(ip)}_{port}{suffix}.txt", args, logger, secrets)
-                add_tool_evidence(state, "smb", ip, port, "nxc smb shares", shares_result, parse_smb_keywords(shares_result.stdout + shares_result.stderr))
+            for domain in collect_domains(args):
+                dsuffix = f"_{safe_filename(domain)}" if domain else ""
+                cred_args, secrets = credential_args(args, "nxc", domain)
+                command = ["nxc", "smb", ip, "--port", str(port)] + cred_args
+                result = run_service_command(command, raw_dir / f"nxc_smb_{safe_filename(ip)}_{port}{suffix}{dsuffix}.txt", args, logger, secrets)
+                add_tool_evidence(state, "smb", ip, port, "nxc smb", result, parse_smb_keywords(result.stdout + result.stderr))
+                update_host_from_smb_text(state, ip, result.stdout + result.stderr)
+                if args.username or args.password or args.ntlm_hash or getattr(args, "username_file", None) or getattr(args, "password_file", None):
+                    shares_command = ["nxc", "smb", ip, "--port", str(port)] + cred_args + ["--shares"]
+                    shares_result = run_service_command(shares_command, raw_dir / f"nxc_smb_shares_{safe_filename(ip)}_{port}{suffix}{dsuffix}.txt", args, logger, secrets)
+                    add_tool_evidence(state, "smb", ip, port, "nxc smb shares", shares_result, parse_smb_keywords(shares_result.stdout + shares_result.stderr))
         if has_tool("crackmapexec"):
-            cred_args, secrets = credential_args(args, "crackmapexec")
-            command = ["crackmapexec", "smb", ip, "--port", str(port)] + cred_args
-            result = run_service_command(command, raw_dir / f"cme_smb_{safe_filename(ip)}_{port}{suffix}.txt", args, logger, secrets)
-            add_tool_evidence(state, "smb", ip, port, "crackmapexec smb", result, parse_smb_keywords(result.stdout + result.stderr))
-            update_host_from_smb_text(state, ip, result.stdout + result.stderr)
+            for domain in collect_domains(args):
+                dsuffix = f"_{safe_filename(domain)}" if domain else ""
+                cred_args, secrets = credential_args(args, "crackmapexec", domain)
+                command = ["crackmapexec", "smb", ip, "--port", str(port)] + cred_args
+                result = run_service_command(command, raw_dir / f"cme_smb_{safe_filename(ip)}_{port}{suffix}{dsuffix}.txt", args, logger, secrets)
+                add_tool_evidence(state, "smb", ip, port, "crackmapexec smb", result, parse_smb_keywords(result.stdout + result.stderr))
+                update_host_from_smb_text(state, ip, result.stdout + result.stderr)
         if has_tool("smbclient"):
             command = ["smbclient", "-L", f"//{ip}", "-N", "-p", str(port)]
             result = run_service_command(command, raw_dir / f"smbclient_list_{safe_filename(ip)}_{port}{suffix}.txt", args, logger, [])
@@ -3282,11 +3445,13 @@ def run_smb_ad_enum(args: argparse.Namespace, state: ScanState, logger: Logger) 
                     )
                 )
         if has_tool("impacket-smbclient"):
-            impacket_input = raw_dir / f"impacket_smbclient_{safe_filename(ip)}_{port}{suffix}.commands"
-            impacket_input.write_text("shares\nexit\n", encoding="utf-8")
-            command, secrets = build_impacket_smbclient_command(args, ip, port, impacket_input)
-            result = run_service_command(command, raw_dir / f"impacket_smbclient_{safe_filename(ip)}_{port}{suffix}.txt", args, logger, secrets)
-            add_tool_evidence(state, "smb", ip, port, "impacket-smbclient shares", result, parse_smb_keywords(result.stdout + result.stderr))
+            for domain in collect_domains(args):
+                dsuffix = f"_{safe_filename(domain)}" if domain else ""
+                impacket_input = raw_dir / f"impacket_smbclient_{safe_filename(ip)}_{port}{suffix}{dsuffix}.commands"
+                impacket_input.write_text("shares\nexit\n", encoding="utf-8")
+                command, secrets = build_impacket_smbclient_command(args, ip, port, impacket_input, domain)
+                result = run_service_command(command, raw_dir / f"impacket_smbclient_{safe_filename(ip)}_{port}{suffix}{dsuffix}.txt", args, logger, secrets)
+                add_tool_evidence(state, "smb", ip, port, "impacket-smbclient shares", result, parse_smb_keywords(result.stdout + result.stderr))
         if has_tool("rpcclient"):
             command = ["rpcclient", "-U", "", "-N", ip, "-p", str(port), "-c", "srvinfo"]
             result = run_service_command(command, raw_dir / f"rpcclient_srvinfo_{safe_filename(ip)}_{port}{suffix}.txt", args, logger, [])
@@ -3295,7 +3460,7 @@ def run_smb_ad_enum(args: argparse.Namespace, state: ScanState, logger: Logger) 
     run_ad_discovery_helpers(args, state, logger)
 
 
-def build_impacket_smbclient_command(args: argparse.Namespace, ip: str, port: int, input_file: Path) -> tuple[list[str], list[str]]:
+def build_impacket_smbclient_command(args: argparse.Namespace, ip: str, port: int, input_file: Path, domain: str = "") -> tuple[list[str], list[str]]:
     command = ["impacket-smbclient", "-inputfile", str(input_file)]
     secrets: list[str] = []
     command.extend(["-port", str(port)])
@@ -3306,8 +3471,10 @@ def build_impacket_smbclient_command(args: argparse.Namespace, ip: str, port: in
         command.append("-k")
     if not (args.username or args.password or args.ntlm_hash or args.kerberos):
         command.append("-no-pass")
-    if args.domain and args.username:
-        target = f"{args.domain}/{args.username}"
+    
+    eff_domain = domain if domain else getattr(args, "domain", "")
+    if eff_domain and args.username:
+        target = f"{eff_domain}/{args.username}"
     elif args.username:
         target = args.username
     else:
@@ -3338,11 +3505,13 @@ def run_ad_discovery_helpers(args: argparse.Namespace, state: ScanState, logger:
         dc_ip = service.ip
         port = service.port
         if has_tool("nxc"):
-            cred_args, secrets = credential_args(args, "nxc")
-            command = ["nxc", "ldap", dc_ip, "--port", str(port)] + cred_args
-            result = run_service_command(command, raw_dir / f"nxc_ldap_{safe_filename(dc_ip)}_{port}.txt", args, logger, secrets)
-            add_tool_evidence(state, "ldap", dc_ip, port, "nxc ldap", result, parse_smb_keywords(result.stdout + result.stderr))
-            update_host_from_smb_text(state, dc_ip, result.stdout + result.stderr)
+            for domain in collect_domains(args):
+                dsuffix = f"_{safe_filename(domain)}" if domain else ""
+                cred_args, secrets = credential_args(args, "nxc", domain)
+                command = ["nxc", "ldap", dc_ip, "--port", str(port)] + cred_args
+                result = run_service_command(command, raw_dir / f"nxc_ldap_{safe_filename(dc_ip)}_{port}{dsuffix}.txt", args, logger, secrets)
+                add_tool_evidence(state, "ldap", dc_ip, port, "nxc ldap", result, parse_smb_keywords(result.stdout + result.stderr))
+                update_host_from_smb_text(state, dc_ip, result.stdout + result.stderr)
     for dc_ip in dc_ips:
         run_host_reverse_lookup(args, state, dc_ip, logger, raw_dir)
 
@@ -3399,10 +3568,12 @@ def run_rdp_enum(args: argparse.Namespace, state: ScanState, logger: Logger) -> 
                     )
                 )
         if has_tool("nxc"):
-            cred_args, secrets = credential_args(args, "nxc")
-            command = ["nxc", "rdp", ip, "--port", str(port)] + cred_args
-            result = run_service_command(command, raw_dir / f"nxc_rdp_{safe_filename(ip)}_{port}.txt", args, logger, secrets)
-            add_tool_evidence(state, "rdp", ip, port, "nxc rdp", result, parse_generic_keywords(result.stdout + result.stderr))
+            for domain in collect_domains(args):
+                dsuffix = f"_{safe_filename(domain)}" if domain else ""
+                cred_args, secrets = credential_args(args, "nxc", domain)
+                command = ["nxc", "rdp", ip, "--port", str(port)] + cred_args
+                result = run_service_command(command, raw_dir / f"nxc_rdp_{safe_filename(ip)}_{port}{dsuffix}.txt", args, logger, secrets)
+                add_tool_evidence(state, "rdp", ip, port, "nxc rdp", result, parse_generic_keywords(result.stdout + result.stderr))
 
 
 def run_ssh_enum(args: argparse.Namespace, state: ScanState, logger: Logger) -> None:
@@ -3461,12 +3632,15 @@ def run_ftp_enum(args: argparse.Namespace, state: ScanState, logger: Logger) -> 
                         severity="medium",
                     )
                 )
-        run_ftp_auth_attempts(args, state, logger, raw_dir, service)
+        # FTP auth attempts are handled centrally by run_credential_auth_enumeration
+        # to avoid duplication; here we only do Nmap NSE and NXC enumeration.
         if has_tool("nxc"):
-            cred_args, secrets = credential_args(args, "nxc")
-            command = ["nxc", "ftp", ip, "--port", str(port)] + cred_args
-            result = run_service_command(command, raw_dir / f"nxc_ftp_{safe_filename(ip)}_{port}.txt", args, logger, secrets)
-            add_tool_evidence(state, "ftp", ip, port, "nxc ftp", result, parse_generic_keywords(result.stdout + result.stderr))
+            for domain in collect_domains(args):
+                dsuffix = f"_{safe_filename(domain)}" if domain else ""
+                cred_args, secrets = credential_args(args, "nxc", domain)
+                command = ["nxc", "ftp", ip, "--port", str(port)] + cred_args
+                result = run_service_command(command, raw_dir / f"nxc_ftp_{safe_filename(ip)}_{port}{dsuffix}.txt", args, logger, secrets)
+                add_tool_evidence(state, "ftp", ip, port, "nxc ftp", result, parse_generic_keywords(result.stdout + result.stderr))
 
 
 def run_ftp_auth_attempts(
@@ -3588,10 +3762,12 @@ def run_database_enum(args: argparse.Namespace, state: ScanState, logger: Logger
                 )
 
             if name == "mssql" and has_tool("nxc"):
-                cred_args, secrets = credential_args(args, "nxc")
-                command = ["nxc", "mssql", service.ip, "--port", str(service.port)] + cred_args
-                result = run_service_command(command, raw_dir / f"nxc_mssql_{safe_filename(service.ip)}_{service.port}.txt", args, logger, secrets)
-                add_tool_evidence(state, name, service.ip, service.port, "nxc mssql", result, parse_generic_keywords(result.stdout + result.stderr))
+                for domain in collect_domains(args):
+                    dsuffix = f"_{safe_filename(domain)}" if domain else ""
+                    cred_args, secrets = credential_args(args, "nxc", domain)
+                    command = ["nxc", "mssql", service.ip, "--port", str(service.port)] + cred_args
+                    result = run_service_command(command, raw_dir / f"nxc_mssql_{safe_filename(service.ip)}_{service.port}{dsuffix}.txt", args, logger, secrets)
+                    add_tool_evidence(state, name, service.ip, service.port, "nxc mssql", result, parse_generic_keywords(result.stdout + result.stderr))
             state.add_evidence(
                 Evidence(
                     category="database",
@@ -3693,8 +3869,9 @@ def run_generic_service_enum(args: argparse.Namespace, state: ScanState, logger:
 def run_kerberos_user_enum_if_enabled(args: argparse.Namespace, state: ScanState, logger: Logger) -> None:
     if not args.enable_user_enum:
         return
-    if not args.kerberos_realm:
-        logger.warn("--enable-user-enum requires --kerberos-realm; skipping Kerberos user enum")
+    realms = resolve_kerberos_realms(args, state)
+    if not realms:
+        logger.warn("No Kerberos realm could be resolved; skipping Kerberos user enum")
         return
     if not has_tool("nmap"):
         logger.warn("Nmap missing; skipping Kerberos user enum")
@@ -3708,25 +3885,27 @@ def run_kerberos_user_enum_if_enabled(args: argparse.Namespace, state: ScanState
         return
     raw_dir = Path(state.output_dir) / RAW_DIR / "services" / "kerberos"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    script_args = [f"krb5-enum-users.realm={args.kerberos_realm}"]
-    if args.user_enum_wordlist:
-        script_args.append(f"userdb={args.user_enum_wordlist}")
     for service in services:
         ip = service.ip
         port = service.port
-        command = [
-            "nmap",
-            "-Pn",
-            "-p",
-            str(port),
-            "--script",
-            "krb5-enum-users",
-            "--script-args",
-            ",".join(script_args),
-            ip,
-        ]
-        result = run_service_command(command, raw_dir / f"nmap_krb5_enum_users_{safe_filename(ip)}_{port}.txt", args, logger, [])
-        add_tool_evidence(state, "kerberos", ip, port, "nmap krb5-enum-users", result, parse_generic_keywords(result.stdout + result.stderr))
+        for realm in realms:
+            dsuffix = f"_{safe_filename(realm)}"
+            curr_args = [f"krb5-enum-users.realm={realm}"]
+            if args.user_enum_wordlist:
+                curr_args.append(f"userdb={args.user_enum_wordlist}")
+            command = [
+                "nmap",
+                "-Pn",
+                "-p",
+                str(port),
+                "--script",
+                "krb5-enum-users",
+                "--script-args",
+                ",".join(curr_args),
+                ip,
+            ]
+            result = run_service_command(command, raw_dir / f"nmap_krb5_enum_users_{safe_filename(ip)}_{port}{dsuffix}.txt", args, logger, [])
+            add_tool_evidence(state, "kerberos", ip, port, "nmap krb5-enum-users", result, parse_generic_keywords(result.stdout + result.stderr))
 
 
 def run_kerbrute_user_enum(args: argparse.Namespace, state: ScanState, logger: Logger) -> None:
@@ -3741,9 +3920,9 @@ def run_kerbrute_user_enum(args: argparse.Namespace, state: ScanState, logger: L
     ]
     if not services:
         return
-    realm = resolve_kerberos_realm(args, state)
-    if not realm:
-        logger.warn("No Kerberos realm available (use --kerberos-realm or ensure domain is discovered); skipping kerbrute")
+    realms = resolve_kerberos_realms(args, state)
+    if not realms:
+        logger.warn("No Kerberos realms available (use --kerberos-realm or ensure domain is discovered); skipping kerbrute")
         return
     wordlist = resolve_kerbrute_wordlist(args)
     if not wordlist:
@@ -3751,7 +3930,7 @@ def run_kerbrute_user_enum(args: argparse.Namespace, state: ScanState, logger: L
         return
     raw_dir = Path(state.output_dir) / RAW_DIR / "services" / "kerberos"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Running kerbrute userenum against {len(services)} Kerberos target(s) with realm {realm}")
+    logger.info(f"Running kerbrute userenum against {len(services)} Kerberos target(s) with {len(realms)} realm(s)")
     seen_ips: set[str] = set()
     for service in services:
         ip = service.ip
@@ -3759,24 +3938,30 @@ def run_kerbrute_user_enum(args: argparse.Namespace, state: ScanState, logger: L
             continue
         seen_ips.add(ip)
         port = service.port
-        command = ["kerbrute", "userenum", "--dc", f"{ip}:{port}", "-d", realm, str(wordlist)]
-        result = run_service_command(command, raw_dir / f"kerbrute_userenum_{safe_filename(ip)}_{port}.txt", args, logger, [])
-        parsed = parse_kerbrute_results(result.stdout + result.stderr)
-        add_tool_evidence(state, "kerberos", ip, port, "kerbrute userenum", result, parsed)
+        for realm in realms:
+            dsuffix = f"_{safe_filename(realm)}"
+            command = ["kerbrute", "userenum", "--dc", f"{ip}:{port}", "-d", realm, str(wordlist)]
+            result = run_service_command(command, raw_dir / f"kerbrute_userenum_{safe_filename(ip)}_{port}{dsuffix}.txt", args, logger, [])
+            parsed = parse_kerbrute_results(result.stdout + result.stderr)
+            add_tool_evidence(state, "kerberos", ip, port, "kerbrute userenum", result, parsed)
 
 
-def resolve_kerberos_realm(args: argparse.Namespace, state: ScanState) -> str:
-    """Determine Kerberos realm: explicit CLI > discovered domain from hosts."""
-    if getattr(args, "kerberos_realm", None):
-        return args.kerberos_realm
+def resolve_kerberos_realms(args: argparse.Namespace, state: ScanState) -> list[str]:
+    """Determine Kerberos realms: explicit CLI > discovered domain from hosts."""
+    realm_arg = getattr(args, "kerberos_realm", None)
+    if realm_arg:
+        return [r.strip() for r in realm_arg.split(",") if r.strip()]
+    domain_arg = getattr(args, "domain", "")
+    if domain_arg:
+        return [r.strip().upper() for r in domain_arg.split(",") if r.strip()]
     hosts = list(state.hosts.values())
     domains = discovered_local_domains(hosts)
     if domains:
-        return domains[0].upper()
+        return [domains[0].upper()]
     for host in hosts:
         if host.domain:
-            return host.domain.strip().strip(".").upper()
-    return ""
+            return [host.domain.strip().strip(".").upper()]
+    return []
 
 
 def resolve_kerbrute_wordlist(args: argparse.Namespace) -> str:
@@ -5590,7 +5775,7 @@ def service_group_actions(group_name: str, services: list[ServiceRecord], state:
 
 def service_group_command_buttons(services: list[ServiceRecord], state: ScanState) -> str:
     sorted_services = sorted_services_unique(services)
-    commands_by_tool: dict[str, list[tuple[ServiceRecord, list[str]]]] = {}
+    commands_by_tool: dict[str, list[tuple[ServiceRecord, list[tuple[str, str]]]]] = {}
     for service in sorted_services:
         for tool, commands in service_primary_commands_by_tool(service, state).items():
             commands_by_tool.setdefault(tool, []).append((service, commands))
@@ -5602,10 +5787,10 @@ def service_group_command_buttons(services: list[ServiceRecord], state: ScanStat
             if loop_command:
                 buttons.append(copy_commands_button(tool, [loop_command]))
                 continue
-        commands: list[str] = []
+        commands_list: list[str] = []
         for _, service_commands in entries:
-            commands.extend(service_commands)
-        buttons.append(copy_commands_button(tool, dedupe_text(commands), loop_multiple=True))
+            commands_list.extend(cmd for _, cmd in service_commands)
+        buttons.append(copy_commands_button(tool, dedupe_text(commands_list), loop_multiple=True))
     return "".join(buttons)
 
 
@@ -5627,7 +5812,7 @@ def service_tool_loop_command(tool: str, services: list[ServiceRecord], state: S
     for service in unique_services:
         service_commands = service_primary_commands_by_tool(service, state)
         if tool in service_commands and service_commands[tool]:
-            commands.extend(service_commands[tool])
+            commands.extend(cmd for _, cmd in service_commands[tool])
     if not commands:
         return ""
     log_file = f"birdscan-{safe_filename(tool.lower())}-all-targets.txt"
@@ -5833,6 +6018,8 @@ def port_details_list(
 ) -> str:
     if not services:
         return empty_state("Nenhuma porta aberta catalogada para este host.")
+    
+    auth_creds = detect_auth_credentials_from_evidence(state)
     endpoints_by_port: dict[tuple[int, str], list[WebEndpoint]] = {}
     for endpoint in endpoints:
         endpoints_by_port.setdefault((endpoint.port, "tcp"), []).append(endpoint)
@@ -5847,6 +6034,15 @@ def port_details_list(
         descriptor_html = f'<span class="muted">{h(descriptor)}</span>' if descriptor else ""
         group = service_group_name(service)
         filter_text = row_filter(service.ip, service.port, service.protocol, service.service, descriptor, group, [endpoint.url for endpoint in service_endpoints])
+        creds = auth_creds.get((service.ip, service.port), [])
+        if not creds:
+            auth_html = '<span class="muted">-</span>'
+        elif len(creds) == 1:
+            auth_html = f'<span class="pill sev-low">{h(creds[0]["label"])}</span>'
+        else:
+            options = "".join(f'<li style="margin-bottom:4px"><span class="pill sev-low">{h(c["label"])}</span></li>' for c in creds)
+            auth_html = f'<details class="inline-web-list"><summary>{len(creds)} credenciais</summary><ul class="evidence-list" style="margin-top:5px;padding-left:0;list-style-type:none;">{options}</ul></details>'
+
         rows.append(
             f'<details class="port-item" data-filter="{filter_text}" data-service="{h(service.service or group)}">'
             "<summary>"
@@ -5861,6 +6057,7 @@ def port_details_list(
             '<div class="kv-grid">'
             f'<div class="kv"><span>Produto</span><div>{h(service.product or "-")}</div></div>'
             f'<div class="kv"><span>Versão/Banner</span><div>{h(service.version or service.banner or "-")}</div></div>'
+            f'<div class="kv"><span>Auth</span><div>{auth_html}</div></div>'
             f'<div class="kv"><span>Interação</span><div>{service_interaction_buttons(service, state)}</div></div>'
             "</div>"
             f"{web_links_block(service_endpoints, state)}"
@@ -5878,7 +6075,7 @@ def service_group_table(
     endpoints_by_host_port: dict[tuple[str, int], list[WebEndpoint]],
     state: ScanState,
 ) -> str:
-    auth_status = detect_auth_status_from_evidence(state)
+    auth_creds = detect_auth_credentials_from_evidence(state)
     rows = [
         '<div class="table-wrap"><table><thead><tr><th>Host</th><th>Porta</th><th>Serviço</th><th>Produto</th><th>Auth</th><th>Web</th><th>Interação</th></tr></thead><tbody>'
     ]
@@ -5888,8 +6085,15 @@ def service_group_table(
         service_endpoints = endpoints_by_host_port.get((service.ip, service.port), [])
         endpoint_links = " ".join(endpoint.url for endpoint in service_endpoints)
         endpoint_links_html = web_dropdown_for_service(service_endpoints, state)
-        auth_label = auth_status.get((service.ip, service.port), "")
-        auth_html = f'<span class="pill sev-low">{h(auth_label)}</span>' if auth_label else '<span class="muted">-</span>'
+        creds = auth_creds.get((service.ip, service.port), [])
+        if not creds:
+            auth_html = '<span class="muted">-</span>'
+        elif len(creds) == 1:
+            auth_html = f'<span class="pill sev-low">{h(creds[0]["label"])}</span>'
+        else:
+            options = "".join(f'<li style="margin-bottom:4px"><span class="pill sev-low">{h(c["label"])}</span></li>' for c in creds)
+            auth_html = f'<details class="inline-web-list"><summary>{len(creds)} credenciais</summary><ul class="evidence-list" style="margin-top:5px;padding-left:0;list-style-type:none;">{options}</ul></details>'
+        
         rows.append(
             f'<tr data-filter="{row_filter(service.ip, hostname, service.port, service.protocol, service.service, service.product, service.version, endpoint_links)}" '
             f'data-service="{h(service.service or service_group_name(service))}">'
@@ -5913,7 +6117,7 @@ def smb_service_group_table(
 ) -> str:
     """Render SMB service group table with SMBv1, Auth and Shares status columns."""
     smbv1_status = detect_smbv1_status_from_evidence(state)
-    auth_status = detect_auth_status_from_evidence(state)
+    auth_creds = detect_auth_credentials_from_evidence(state)
     shares_status = detect_smb_shares_from_evidence(state)
     rows = [
         '<div class="table-wrap"><table><thead><tr><th>Host</th><th>Porta</th><th>Serviço</th><th>Produto</th><th>SMBv1</th><th>Auth</th><th>Shares</th><th>Web</th><th>Interação</th></tr></thead><tbody>'
@@ -5932,11 +6136,14 @@ def smb_service_group_table(
             smbv1_html = '<span class="muted">False</span>'
         else:
             smbv1_html = '<span class="muted">-</span>'
-        auth_label = auth_status.get(smbv1_key, "")
-        if auth_label:
-            auth_html = f'<span class="sev-medium" style="font-weight:800">✓ {h(auth_label)}</span>'
-        else:
+        creds = auth_creds.get(smbv1_key, [])
+        if not creds:
             auth_html = '<span class="muted">-</span>'
+        elif len(creds) == 1:
+            auth_html = f'<span class="sev-medium" style="font-weight:800">✓ {h(creds[0]["label"])}</span>'
+        else:
+            options = "".join(f'<li style="margin-bottom:4px"><span class="sev-medium" style="font-weight:800">✓ {h(c["label"])}</span></li>' for c in creds)
+            auth_html = f'<details class="inline-web-list"><summary>{len(creds)} credenciais</summary><ul class="evidence-list" style="margin-top:5px;padding-left:0;list-style-type:none;">{options}</ul></details>'
         shares_found = shares_status.get(smbv1_key, False)
         if shares_found:
             shares_anchor = f"shares-{safe_filename(service.ip)}-{service.port}"
@@ -5944,7 +6151,7 @@ def smb_service_group_table(
         else:
             shares_html = '<span class="muted">-</span>'
         rows.append(
-            f'<tr data-filter="{row_filter(service.ip, hostname, service.port, service.protocol, service.service, service.product, service.version, endpoint_links, "smbv1" if smbv1_enabled else "", auth_label, "shares" if shares_found else "")}" '
+            f'<tr data-filter="{row_filter(service.ip, hostname, service.port, service.protocol, service.service, service.product, service.version, endpoint_links, "smbv1" if smbv1_enabled else "", " ".join(c["label"] for c in creds), "shares" if shares_found else "")}" '
             f'data-service="{h(service.service or service_group_name(service))}">'
             f'<td><span class="mono">{h(service.ip)}</span><br><span class="muted">{h(hostname)}</span></td>'
             f'<td class="mono nowrap">{h(service.port)}/{h(service.protocol)}</td>'
@@ -5986,30 +6193,33 @@ def detect_smbv1_status_from_evidence(state: ScanState) -> dict[tuple[str, int],
     return result
 
 
-def detect_auth_status_from_evidence(state: ScanState) -> dict[tuple[str, int], str]:
-    """Return auth status label per IP:port from evidence data."""
-    result: dict[tuple[str, int], str] = {}
+def detect_auth_credentials_from_evidence(state: ScanState) -> dict[tuple[str, int], list[dict[str, str]]]:
+    """Return a list of auth credentials per IP:port from evidence data."""
+    result: dict[tuple[str, int], list[dict[str, str]]] = {}
     for item in state.evidence:
         if item.port is None:
             continue
         key = (item.ip, item.port)
+        if key not in result:
+            result[key] = []
         # Check for successful auth evidence
         if item.data.get("auth_result") == "accepted":
-            username = item.data.get("username", "")
+            username = item.data.get("username", "") or ""
+            password = item.data.get("password", "") or item.data.get("ntlm_hash", "") or ""
+            method = item.data.get("auth_method", "") or ""
             if not username or username in {"", "anonymous", "guest"}:
-                if key not in result or result[key] in {"anonymous/null", "anonymous"}:
-                    result[key] = "anonymous"
+                label = "anonymous"
             else:
-                password = item.data.get("password", "")
-                if password:
-                    result[key] = f"{username}:{password}"
-                else:
-                    result[key] = username
+                label = f"{username}:{password}" if password else username
+            cred = {"username": username, "password": password, "method": method, "label": label}
+            if cred not in result[key]:
+                result[key].append(cred)
             continue
         # Check for anonymous/null session in parsed SMB data
         if item.category == "smb" and item.data.get("anonymous_or_null_session"):
-            if key not in result:
-                result[key] = "anonymous/null"
+            cred = {"username": "anonymous", "password": "", "method": "anonymous", "label": "anonymous/null"}
+            if cred not in result[key]:
+                result[key].append(cred)
     return result
 
 
@@ -6731,7 +6941,23 @@ def service_interaction_buttons(service: ServiceRecord, state: ScanState) -> str
     buttons: list[str] = []
     if service_group_name(service) == "WEB":
         buttons.append(open_url_button("Abrir", build_url(preferred_scheme_for_service(service), service.ip, service.port, "/")))
-    buttons.extend(copy_commands_button(label, commands, loop_multiple=True) for label, commands in by_tool.items())
+    
+    for tool_label, cmds in by_tool.items():
+        if not cmds:
+            continue
+        if len(cmds) == 1:
+            cmd_label, cmd_text = cmds[0]
+            buttons.append(copy_commands_button(tool_label, [cmd_text]))
+        else:
+            options = "".join(f'<div style="margin-bottom:4px">{copy_commands_button(cmd_label, [cmd_text])}</div>' for cmd_label, cmd_text in cmds)
+            # Add a dropdown button for multiple commands
+            buttons.append(
+                f'<details class="inline-web-list" style="display:inline-block; vertical-align:top; margin-right:6px;">'
+                f'<summary class="copy-btn" style="padding:6px 9px; min-width:max-content;">{h(tool_label)} <span style="font-size:10px">({len(cmds)})▼</span></summary>'
+                f'<div style="position:absolute; background:var(--panel); border:1px solid var(--line); padding:8px; border-radius:6px; z-index:10; margin-top:4px;">{options}</div>'
+                f'</details>'
+            )
+            
     return '<div class="copy-actions">' + "".join(buttons) + "</div>"
 
 
@@ -6807,210 +7033,273 @@ def service_nmap_scripts(service: ServiceRecord) -> str:
     return "banner"
 
 
-def service_primary_commands_by_tool(service: ServiceRecord, state: ScanState) -> dict[str, list[str]]:
+def service_primary_commands_by_tool(service: ServiceRecord, state: ScanState) -> dict[str, list[tuple[str, str]]]:
     ip = service.ip
     port = service.port
     group = service_group_name(service)
     netcat = f"nc -nv {shlex_quote(ip)} {port}"
-    commands: dict[str, list[str]] = {
-        "Nmap Versão": [service_nmap_command(service)],
-        "Nmap NSE": [service_nmap_script_command(service)],
+    commands: dict[str, list[tuple[str, str]]] = {
+        "Nmap Versão": [("-", service_nmap_command(service))],
+        "Nmap NSE": [("-", service_nmap_script_command(service))],
     }
     
-    # Check for validated credentials on this service
-    valid_user, valid_pass, valid_method = "", "", ""
-    for evidence in state.evidence:
-        if evidence.ip == ip and evidence.port == port and evidence.data.get("auth_result") == "accepted":
-            u = evidence.data.get("username", "") or ""
-            p = evidence.data.get("password", "") or ""
-            m = evidence.data.get("auth_method", "") or ""
-            if not valid_user or (valid_user in {"", "anonymous", "guest"} and u not in {"", "anonymous", "guest"}):
-                valid_user = u
-                valid_pass = p
-                valid_method = m
-
+    creds = detect_auth_credentials_from_evidence(state).get((ip, port), [])
+    
     if service.protocol == "tcp":
-        commands["NetCat"] = [netcat]
+        commands["NetCat"] = [("-", netcat)]
     if group == "WEB":
         scheme = preferred_scheme_for_service(service)
         url = build_url(scheme, ip, port, "/")
         commands.update({
-            "CURL": [f"curl -k -i -L --max-time 10 -A Mozilla/5.0 {shlex_quote(url)}"],
-            "WhatWeb": [f"whatweb --no-errors {shlex_quote(url)}"],
+            "CURL": [("-", f"curl -k -i -L --max-time 10 -A Mozilla/5.0 {shlex_quote(url)}")],
+            "WhatWeb": [("-", f"whatweb --no-errors {shlex_quote(url)}")],
         })
         return commands
     if group == "SMB":
-        nxc_cmd = f"nxc smb {shlex_quote(ip)} --port {port} --shares"
-        cme_cmd = f"crackmapexec smb {shlex_quote(ip)} --port {port} --shares"
-        rpc_cmd = f"rpcclient -U '' -N {shlex_quote(ip)} -p {port} -c srvinfo"
-        smbclient_cmd = f"smbclient -L //{shlex_quote(ip)} -N -p {port}"
-        impacket_cmd = f"printf 'shares\\nexit\\n' | impacket-smbclient -port {port} -no-pass {shlex_quote(ip)}"
+        nxc_cmds = []
+        cme_cmds = []
+        rpc_cmds = []
+        smbclient_cmds = []
+        impacket_cmds = []
+        pth_cmds = []
         
-        if valid_user or valid_pass:
-            auth_nxc = f" -u {shlex_quote(valid_user)} -p {shlex_quote(valid_pass)}" if valid_method == "password" else f" -u {shlex_quote(valid_user)} -H {shlex_quote(valid_pass)}"
-            nxc_cmd = f"nxc smb {shlex_quote(ip)} --port {port} --shares{auth_nxc}"
-            cme_cmd = f"crackmapexec smb {shlex_quote(ip)} --port {port} --shares{auth_nxc}"
-            if valid_method == "password":
-                rpc_cmd = f"rpcclient -U {shlex_quote(valid_user)} {shlex_quote(ip)} -p {port} -c srvinfo"
-                smbclient_cmd = f"smbclient -L //{shlex_quote(ip)} -U {shlex_quote(valid_user)} -p {port}"
-                impacket_cmd = f"printf 'shares\\nexit\\n' | impacket-smbclient -port {port} {shlex_quote(valid_user)}:{shlex_quote(valid_pass)}@{shlex_quote(ip)}"
-            else:
-                impacket_cmd = f"printf 'shares\\nexit\\n' | impacket-smbclient -port {port} -hashes {shlex_quote(valid_pass)} {shlex_quote(valid_user)}@{shlex_quote(ip)}"
+        if not creds:
+            nxc_cmds.append(("-", f"nxc smb {shlex_quote(ip)} --port {port} --users --disks --shares -x whoami"))
+            cme_cmds.append(("-", f"crackmapexec smb {shlex_quote(ip)} --port {port} --users --disks --shares -x whoami"))
+            rpc_cmds.append(("-", f"rpcclient -U '' -N {shlex_quote(ip)} -p {port} -c srvinfo"))
+            smbclient_cmds.append(("-", f"smbclient -L //{shlex_quote(ip)} -N -p {port}"))
+            impacket_cmds.append(("-", f"impacket-smbclient -port {port} -no-pass {shlex_quote(ip)}"))
+            impacket_cmds.append(("-", f"impacket-rpcdump -port {port} -no-pass {shlex_quote(ip)}"))
+        else:
+            for cred in creds:
+                u, p, m, label = cred["username"], cred["password"], cred["method"], cred["label"]
+                auth_nxc = f" -u {shlex_quote(u)} -p {shlex_quote(p)}" if m == "password" else f" -u {shlex_quote(u)} -H {shlex_quote(p)}"
+                nxc_cmds.append((label, f"nxc smb {shlex_quote(ip)} --port {port} --users --disks --shares -x whoami{auth_nxc}"))
+                cme_cmds.append((label, f"crackmapexec smb {shlex_quote(ip)} --port {port} --users --disks --shares -x whoami{auth_nxc}"))
+                if m == "password":
+                    rpc_cmds.append((label, f"rpcclient -U {shlex_quote(u)} {shlex_quote(ip)} -p {port} -c srvinfo"))
+                    smbclient_cmds.append((label, f"smbclient -L //{shlex_quote(ip)} -U {shlex_quote(u)} -p {port}"))
+                    imp_auth = f"{shlex_quote(u)}:{shlex_quote(p)}@{shlex_quote(ip)}"
+                    impacket_cmds.append((f"{label} (smbclient)", f"impacket-smbclient -port {port} {imp_auth}"))
+                    impacket_cmds.append((f"{label} (wmiexec)", f"impacket-wmiexec -port {port} {imp_auth}"))
+                    impacket_cmds.append((f"{label} (psexec)", f"impacket-psexec -port {port} {imp_auth}"))
+                    impacket_cmds.append((f"{label} (smbexec)", f"impacket-smbexec -port {port} {imp_auth}"))
+                    impacket_cmds.append((f"{label} (atexec)", f"impacket-atexec -port {port} {imp_auth} whoami"))
+                    impacket_cmds.append((f"{label} (rpcdump)", f"impacket-rpcdump -port {port} {imp_auth}"))
+                else:
+                    imp_auth = f"-hashes {shlex_quote(p)} {shlex_quote(u)}@{shlex_quote(ip)}"
+                    impacket_cmds.append((f"{label} (smbclient)", f"impacket-smbclient -port {port} {imp_auth}"))
+                    impacket_cmds.append((f"{label} (wmiexec)", f"impacket-wmiexec -port {port} {imp_auth}"))
+                    impacket_cmds.append((f"{label} (psexec)", f"impacket-psexec -port {port} {imp_auth}"))
+                    impacket_cmds.append((f"{label} (smbexec)", f"impacket-smbexec -port {port} {imp_auth}"))
+                    impacket_cmds.append((f"{label} (atexec)", f"impacket-atexec -port {port} {imp_auth} whoami"))
+                    impacket_cmds.append((f"{label} (rpcdump)", f"impacket-rpcdump -port {port} {imp_auth}"))
+                    pth_auth = f"{shlex_quote(u)}%{shlex_quote(p)}"
+                    pth_cmds.append((f"{label} (smbclient)", f"pth-smbclient -U {pth_auth} //{shlex_quote(ip)}/c$"))
+                    pth_cmds.append((f"{label} (wmic)", f"pth-wmic -U {pth_auth} //{shlex_quote(ip)} 'select Name from Win32_UserAccount'"))
+                    pth_cmds.append((f"{label} (rpcclient)", f"pth-rpcclient -U {pth_auth} //{shlex_quote(ip)}"))
 
         commands.update({
-            "SMBClient": [smbclient_cmd],
-            "NXC": [nxc_cmd],
-            "CrackMapExec": [cme_cmd],
-            "RPCClient": [rpc_cmd],
-            "Impacket": [impacket_cmd],
+            "SMBClient": smbclient_cmds,
+            "NXC": nxc_cmds,
+            "CrackMapExec": cme_cmds,
+            "RPCClient": rpc_cmds,
+            "Impacket": impacket_cmds,
         })
+        if pth_cmds:
+            commands["PassTheHash"] = pth_cmds
         return commands
     if group == "RDP":
-        nxc_rdp = f"nxc rdp {shlex_quote(ip)} --port {port}"
-        xfreerdp = f"xfreerdp /v:{ip}:{port} /cert:ignore /dynamic-resolution"
-        if valid_user or valid_pass:
-            if valid_method == "password":
-                nxc_rdp += f" -u {shlex_quote(valid_user)} -p {shlex_quote(valid_pass)}"
-                xfreerdp += f" /u:{shlex_quote(valid_user)} /p:{shlex_quote(valid_pass)}"
-            else:
-                nxc_rdp += f" -u {shlex_quote(valid_user)} -H {shlex_quote(valid_pass)}"
-                xfreerdp += f" /u:{shlex_quote(valid_user)} /pth:{shlex_quote(valid_pass)}"
+        xfreerdp_cmds = []
+        nxc_cmds = []
+        if not creds:
+            xfreerdp_cmds.append(("-", f"xfreerdp /v:{ip}:{port} /cert:ignore /dynamic-resolution"))
+            nxc_cmds.append(("-", f"nxc rdp {shlex_quote(ip)} --port {port} --screendump"))
+        else:
+            for cred in creds:
+                u, p, m, label = cred["username"], cred["password"], cred["method"], cred["label"]
+                if m == "password":
+                    xfreerdp_cmds.append((label, f"xfreerdp /v:{ip}:{port} /cert:ignore /dynamic-resolution /u:{shlex_quote(u)} /p:{shlex_quote(p)}"))
+                    nxc_cmds.append((label, f"nxc rdp {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -p {shlex_quote(p)} --screendump"))
+                else:
+                    xfreerdp_cmds.append((label, f"xfreerdp /v:{ip}:{port} /cert:ignore /dynamic-resolution /u:{shlex_quote(u)} /pth:{shlex_quote(p)}"))
+                    nxc_cmds.append((label, f"nxc rdp {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -H {shlex_quote(p)} --screendump"))
 
         commands.update({
-            "XFreeRDP": [xfreerdp],
-            "RDesktop": [f"rdesktop {ip}:{port}"],
-            "NXC RDP": [nxc_rdp],
+            "XFreeRDP": xfreerdp_cmds,
+            "RDesktop": [("-", f"rdesktop {ip}:{port}")],
+            "NXC RDP": nxc_cmds,
         })
         return commands
     if group == "SSH":
-        ssh_cmd = f"ssh -p {port} user@{shlex_quote(ip)}"
-        if valid_user:
-            ssh_cmd = f"ssh -p {port} {shlex_quote(valid_user)}@{shlex_quote(ip)}"
-        commands["SSH"] = [ssh_cmd]
+        ssh_cmds = []
+        if not creds:
+            ssh_cmds.append(("-", f"ssh -p {port} user@{shlex_quote(ip)}"))
+        else:
+            for cred in creds:
+                u, label = cred["username"], cred["label"]
+                ssh_cmds.append((label, f"ssh -p {port} {shlex_quote(u)}@{shlex_quote(ip)}"))
+        commands["SSH"] = ssh_cmds
         return commands
     if group == "FTP":
         commands.update({
-            "FTP anonymous": [f"printf 'anonymous\\nanonymous\\npwd\\nls\\nbye\\n' | ftp -inv -p {shlex_quote(ip)} {port}"],
-            "FTP ftp": [f"printf 'ftp\\nftp\\npwd\\nls\\nbye\\n' | ftp -inv -p {shlex_quote(ip)} {port}"],
-            "LFTP anon": [f"lftp -u anonymous,anonymous -p {port} {shlex_quote(ip)} -e 'pwd; ls; bye'"],
-            "LFTP ftp": [f"lftp -u ftp,ftp -p {port} {shlex_quote(ip)} -e 'pwd; ls; bye'"],
-            "NXC FTP": [f"nxc ftp {shlex_quote(ip)} --port {port}"],
+            "FTP anon": [("-", f"printf 'anonymous\\nanonymous\\npwd\\nls\\nbye\\n' | ftp -inv -p {shlex_quote(ip)} {port}")],
+            "FTP ftp": [("-", f"printf 'ftp\\nftp\\npwd\\nls\\nbye\\n' | ftp -inv -p {shlex_quote(ip)} {port}")],
+            "LFTP anon": [("-", f"lftp -u anonymous,anonymous -p {port} {shlex_quote(ip)} -e 'pwd; ls; bye'")],
+            "LFTP ftp": [("-", f"lftp -u ftp,ftp -p {port} {shlex_quote(ip)} -e 'pwd; ls; bye'")],
+            "NXC FTP": [("-", f"nxc ftp {shlex_quote(ip)} --port {port} --ls")],
         })
-        if valid_user:
-            commands["FTP auth"] = [f"printf '{valid_user}\\n{valid_pass}\\npwd\\nls\\nbye\\n' | ftp -inv -p {shlex_quote(ip)} {port}"]
+        if creds:
+            ftp_auth_cmds = []
+            for cred in creds:
+                u, p, label = cred["username"], cred["password"], cred["label"]
+                ftp_auth_cmds.append((label, f"printf '{u}\\n{p}\\npwd\\nls\\nbye\\n' | ftp -inv -p {shlex_quote(ip)} {port}"))
+            commands["FTP auth"] = ftp_auth_cmds
         return commands
     if group == "LDAP/AD":
         ldap_scheme = "ldaps" if port in {636, 3269} else "ldap"
-        ldap_cmd = f"ldapsearch -x -H {ldap_scheme}://{ip}:{port} -s base"
-        nxc_ldap = f"nxc ldap {shlex_quote(ip)} --port {port}"
-        if valid_user or valid_pass:
-            if valid_method == "password":
-                nxc_ldap += f" -u {shlex_quote(valid_user)} -p {shlex_quote(valid_pass)}"
-            else:
-                nxc_ldap += f" -u {shlex_quote(valid_user)} -H {shlex_quote(valid_pass)}"
+        ldap_cmds = [("-", f"ldapsearch -x -H {ldap_scheme}://{ip}:{port} -s base")]
+        nxc_cmds = []
+        if not creds:
+            nxc_cmds.append(("-", f"nxc ldap {shlex_quote(ip)} --port {port} --users --groups"))
+        else:
+            for cred in creds:
+                u, p, m, label = cred["username"], cred["password"], cred["method"], cred["label"]
+                auth_nxc = f" -u {shlex_quote(u)} -p {shlex_quote(p)}" if m == "password" else f" -u {shlex_quote(u)} -H {shlex_quote(p)}"
+                nxc_cmds.append((label, f"nxc ldap {shlex_quote(ip)} --port {port} --users --groups{auth_nxc}"))
         commands.update({
-            "LDAPSearch": [ldap_cmd],
-            "NXC LDAP": [nxc_ldap],
+            "LDAPSearch": ldap_cmds,
+            "NXC LDAP": nxc_cmds,
         })
         return commands
     if group == "KERBEROS":
-        commands["KRB5 info"] = [f"nmap -sV -Pn -p {port} --script krb5-info {shlex_quote(ip)}"]
         realm = "DOMAIN.LOCAL"
         kerbrute_wordlist = "/usr/share/seclists/Usernames/xato-net-10-million-usernames.txt"
-        commands["Kerbrute userenum"] = [f"kerbrute userenum --dc {shlex_quote(ip)}:{port} -d {realm} {shlex_quote(kerbrute_wordlist)}"]
-        commands["Kerbrute passwordspray"] = [f"kerbrute passwordspray --dc {shlex_quote(ip)}:{port} -d {realm} {shlex_quote(kerbrute_wordlist)} Senha123!"]
-        commands["Impacket GetNPUsers"] = [f"impacket-GetNPUsers {realm}/ -no-pass -usersfile lista-de-user-valido.txt -format hashcat -outputfile hashes-found.txt -dc-ip {shlex_quote(ip)}"]
+        commands["KRB5 info"] = [("-", f"nmap -sV -Pn -p {port} --script krb5-info {shlex_quote(ip)}")]
+        commands["Kerbrute userenum"] = [("-", f"kerbrute userenum --dc {shlex_quote(ip)}:{port} -d {realm} {shlex_quote(kerbrute_wordlist)}")]
+        commands["Kerbrute passwordspray"] = [("-", f"kerbrute passwordspray --dc {shlex_quote(ip)}:{port} -d {realm} {shlex_quote(kerbrute_wordlist)} Senha123!")]
+        commands["Impacket GetNPUsers"] = [("-", f"impacket-GetNPUsers {realm}/ -no-pass -usersfile lista-de-user-valido.txt -format hashcat -outputfile hashes-found.txt -dc-ip {shlex_quote(ip)}")]
         return commands
     if group == "DATABASE/DATA":
         service_name = (service.service or "").lower()
         if port in MYSQL_PORTS or "mysql" in service_name:
-            mysql_cmd = f"mysql -h {shlex_quote(ip)} -P {port} -u root -p"
-            if valid_user:
-                mysql_cmd = f"mysql -h {shlex_quote(ip)} -P {port} -u {shlex_quote(valid_user)}"
-                if valid_pass:
-                    mysql_cmd += f" -p{shlex_quote(valid_pass)}"
-            commands["MySQL"] = [mysql_cmd]
+            mysql_cmds = []
+            if not creds:
+                mysql_cmds.append(("-", f"mysql -h {shlex_quote(ip)} -P {port} -u root -p"))
+            else:
+                for cred in creds:
+                    u, p, label = cred["username"], cred["password"], cred["label"]
+                    cmd = f"mysql -h {shlex_quote(ip)} -P {port} -u {shlex_quote(u)}"
+                    if p:
+                        cmd += f" -p{shlex_quote(p)}"
+                    mysql_cmds.append((label, cmd))
+            commands["MySQL"] = mysql_cmds
         if port in POSTGRES_PORTS or "postgres" in service_name:
-            psql_cmd = f"psql -h {shlex_quote(ip)} -p {port} -U postgres"
-            if valid_user:
-                psql_cmd = f"psql -h {shlex_quote(ip)} -p {port} -U {shlex_quote(valid_user)}"
-                if valid_pass:
-                    psql_cmd = f"PGPASSWORD={shlex_quote(valid_pass)} {psql_cmd}"
-            commands["Postgres"] = [psql_cmd]
+            psql_cmds = []
+            if not creds:
+                psql_cmds.append(("-", f"psql -h {shlex_quote(ip)} -p {port} -U postgres"))
+            else:
+                for cred in creds:
+                    u, p, label = cred["username"], cred["password"], cred["label"]
+                    cmd = f"psql -h {shlex_quote(ip)} -p {port} -U {shlex_quote(u)}"
+                    if p:
+                        cmd = f"PGPASSWORD={shlex_quote(p)} {cmd}"
+                    psql_cmds.append((label, cmd))
+            commands["Postgres"] = psql_cmds
         if port in MSSQL_PORTS or "ms-sql" in service_name or "mssql" in service_name:
-            mssql_impacket = f"impacket-mssqlclient -port {port} user:pass@{shlex_quote(ip)}"
-            mssql_nxc = f"nxc mssql {shlex_quote(ip)} --port {port}"
-            if valid_user or valid_pass:
-                if valid_method == "password":
-                    mssql_impacket = f"impacket-mssqlclient -port {port} {shlex_quote(valid_user)}:{shlex_quote(valid_pass)}@{shlex_quote(ip)}"
-                    mssql_nxc += f" -u {shlex_quote(valid_user)} -p {shlex_quote(valid_pass)}"
-                else:
-                    mssql_impacket = f"impacket-mssqlclient -port {port} -hashes {shlex_quote(valid_pass)} {shlex_quote(valid_user)}@{shlex_quote(ip)}"
-                    mssql_nxc += f" -u {shlex_quote(valid_user)} -H {shlex_quote(valid_pass)}"
-            commands["MSSQL"] = [mssql_impacket, mssql_nxc]
+            mssql_impacket_cmds = []
+            mssql_nxc_cmds = []
+            if not creds:
+                mssql_impacket_cmds.append(("-", f"impacket-mssqlclient -port {port} user:pass@{shlex_quote(ip)}"))
+                mssql_nxc_cmds.append(("-", f"nxc mssql {shlex_quote(ip)} --port {port} -q 'select @@version'"))
+            else:
+                for cred in creds:
+                    u, p, m, label = cred["username"], cred["password"], cred["method"], cred["label"]
+                    if m == "password":
+                        mssql_impacket_cmds.append((label, f"impacket-mssqlclient -port {port} {shlex_quote(u)}:{shlex_quote(p)}@{shlex_quote(ip)}"))
+                        mssql_nxc_cmds.append((label, f"nxc mssql {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -p {shlex_quote(p)} -q 'select @@version'"))
+                    else:
+                        mssql_impacket_cmds.append((label, f"impacket-mssqlclient -port {port} -hashes {shlex_quote(p)} {shlex_quote(u)}@{shlex_quote(ip)}"))
+                        mssql_nxc_cmds.append((label, f"nxc mssql {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -H {shlex_quote(p)} -q 'select @@version'"))
+            commands["MSSQL"] = mssql_impacket_cmds + mssql_nxc_cmds
         if port in REDIS_PORTS or "redis" in service_name:
-            redis_cmd = f"redis-cli -h {shlex_quote(ip)} -p {port} INFO"
-            if valid_pass:
-                redis_cmd = f"redis-cli -h {shlex_quote(ip)} -p {port} -a {shlex_quote(valid_pass)} INFO"
-            commands["Redis"] = [redis_cmd]
+            redis_cmds = []
+            if not creds:
+                redis_cmds.append(("-", f"redis-cli -h {shlex_quote(ip)} -p {port} INFO"))
+            else:
+                for cred in creds:
+                    p, label = cred["password"], cred["label"]
+                    cmd = f"redis-cli -h {shlex_quote(ip)} -p {port} -a {shlex_quote(p)} INFO" if p else f"redis-cli -h {shlex_quote(ip)} -p {port} INFO"
+                    redis_cmds.append((label, cmd))
+            commands["Redis"] = redis_cmds
         if port in MONGO_PORTS or "mongo" in service_name:
-            mongo_cmd = f"mongosh --host {shlex_quote(ip)} --port {port}"
-            if valid_user and valid_pass:
-                mongo_cmd = f"mongosh --host {shlex_quote(ip)} --port {port} -u {shlex_quote(valid_user)} -p {shlex_quote(valid_pass)}"
-            commands["Mongo"] = [mongo_cmd]
+            mongo_cmds = []
+            if not creds:
+                mongo_cmds.append(("-", f"mongosh --host {shlex_quote(ip)} --port {port}"))
+            else:
+                for cred in creds:
+                    u, p, label = cred["username"], cred["password"], cred["label"]
+                    cmd = f"mongosh --host {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -p {shlex_quote(p)}" if u and p else f"mongosh --host {shlex_quote(ip)} --port {port}"
+                    mongo_cmds.append((label, cmd))
+            commands["Mongo"] = mongo_cmds
         if port in ELASTIC_PORTS or "elastic" in service_name:
-            commands["Elastic"] = [f"curl -s {shlex_quote(build_url('http', ip, port, '/_cluster/health?pretty'))}"]
+            commands["Elastic"] = [("-", f"curl -s {shlex_quote(build_url('http', ip, port, '/_cluster/health?pretty'))}")]
         return commands
     if group == "WINRM":
-        winrm_cmd = f"evil-winrm -i {shlex_quote(ip)} -P {port} -u user -p 'password'"
-        nxc_winrm = f"nxc winrm {shlex_quote(ip)} --port {port}"
-        if valid_user or valid_pass:
-            if valid_method == "password":
-                winrm_cmd = f"evil-winrm -i {shlex_quote(ip)} -P {port} -u {shlex_quote(valid_user)} -p {shlex_quote(valid_pass)}"
-                nxc_winrm += f" -u {shlex_quote(valid_user)} -p {shlex_quote(valid_pass)}"
-            else:
-                winrm_cmd = f"evil-winrm -i {shlex_quote(ip)} -P {port} -u {shlex_quote(valid_user)} -H {shlex_quote(valid_pass)}"
-                nxc_winrm += f" -u {shlex_quote(valid_user)} -H {shlex_quote(valid_pass)}"
+        winrm_cmds = []
+        nxc_cmds = []
+        if not creds:
+            winrm_cmds.append(("-", f"evil-winrm -i {shlex_quote(ip)} -P {port} -u user -p 'password'"))
+            nxc_cmds.append(("-", f"nxc winrm {shlex_quote(ip)} --port {port} -x whoami"))
+        else:
+            for cred in creds:
+                u, p, m, label = cred["username"], cred["password"], cred["method"], cred["label"]
+                if m == "password":
+                    winrm_cmds.append((label, f"evil-winrm -i {shlex_quote(ip)} -P {port} -u {shlex_quote(u)} -p {shlex_quote(p)}"))
+                    nxc_cmds.append((label, f"nxc winrm {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -p {shlex_quote(p)} -x whoami"))
+                else:
+                    winrm_cmds.append((label, f"evil-winrm -i {shlex_quote(ip)} -P {port} -u {shlex_quote(u)} -H {shlex_quote(p)}"))
+                    nxc_cmds.append((label, f"nxc winrm {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -H {shlex_quote(p)} -x whoami"))
         commands.update({
-            "Evil-WinRM": [winrm_cmd],
-            "NXC WinRM": [nxc_winrm],
-            "CURL": [f"curl -k -i --max-time 10 {shlex_quote(build_url('https' if port == 5986 else 'http', ip, port, '/wsman'))}"],
+            "Evil-WinRM": winrm_cmds,
+            "NXC WinRM": nxc_cmds,
+            "CURL": [("-", f"curl -k -i --max-time 10 {shlex_quote(build_url('https' if port == 5986 else 'http', ip, port, '/wsman'))}")],
         })
         return commands
     if group == "NFS/RPC":
         commands.update({
-            "Showmount": [f"showmount -e {shlex_quote(ip)}"],
-            "RPCInfo": [f"rpcinfo -p {shlex_quote(ip)}"],
+            "Showmount": [("-", f"showmount -e {shlex_quote(ip)}")],
+            "RPCInfo": [("-", f"rpcinfo -p {shlex_quote(ip)}")],
         })
         return commands
     if group == "SNMP":
-        commands["SNMPWalk"] = [f"snmpwalk -v2c -c public udp:{shlex_quote(ip)}:{port}"]
+        commands["SNMPWalk"] = [("-", f"snmpwalk -v2c -c public udp:{shlex_quote(ip)}:{port}")]
         return commands
     if group == "VNC":
-        commands["VNCViewer"] = [f"vncviewer {ip}::{port}"]
+        commands["VNCViewer"] = [("-", f"vncviewer {ip}::{port}")]
         return commands
     if group == "CONTAINER":
         commands.update({
-            "CURL HTTPS": [f"curl -k -i {shlex_quote(build_url('https', ip, port, '/version'))}"],
-            "CURL HTTP": [f"curl -i {shlex_quote(build_url('http', ip, port, '/version'))}"],
+            "CURL HTTPS": [("-", f"curl -k -i {shlex_quote(build_url('https', ip, port, '/version'))}")],
+            "CURL HTTP": [("-", f"curl -i {shlex_quote(build_url('http', ip, port, '/version'))}")],
         })
         return commands
     if group == "TELNET":
-        commands["Telnet"] = [f"telnet {shlex_quote(ip)} {port}"]
+        commands["Telnet"] = [("-", f"telnet {shlex_quote(ip)} {port}")]
         return commands
     if group == "MAIL":
         commands.update({
-            "Swaks": [f"swaks --server {shlex_quote(ip)} --port {port} --quit-after HELO"],
-            "OpenSSL": [f"openssl s_client -connect {ip}:{port} -servername {ip}"],
+            "Swaks": [("-", f"swaks --server {shlex_quote(ip)} --port {port} --quit-after HELO")],
+            "OpenSSL": [("-", f"openssl s_client -connect {ip}:{port} -servername {ip}")],
         })
         return commands
     if group == "DNS":
         commands.update({
-            "DIG version": [f"dig @{shlex_quote(ip)} -p {port} version.bind chaos txt"],
-            "DIG AXFR": [f"dig @{shlex_quote(ip)} -p {port} axfr domain.local"],
+            "DIG version": [("-", f"dig @{shlex_quote(ip)} -p {port} version.bind chaos txt")],
+            "DIG AXFR": [("-", f"dig @{shlex_quote(ip)} -p {port} axfr domain.local")],
         })
         return commands
-    commands["NetCat"] = [netcat]
+    commands["NetCat"] = [("-", netcat)]
     return commands
 
 
@@ -7369,15 +7658,18 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
     report_text = report_path.read_text(encoding="utf-8", errors="replace")
     default_nmap_command = build_nmap_command(test_args, ["10.10.10.0/24"], Path(state.output_dir) / RAW_DIR / "nmap" / "default-check")
     gobuster_commands = fuzz_commands_by_tool("http://10.10.10.50:8080/").get("Gobuster", [])
-    ftp_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.50", port=21, service="ftp"), state)
-    smb_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.60", port=139, service="netbios-ssn"), state)
-    rdp_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.30", port=3390, service="ms-wbt-server"), state)
-    ssh_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.50", port=2222, service="ssh"), state)
-    ldap_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.40", port=636, service="ldaps"), state)
-    kerberos_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.40", port=88, service="kerberos"), state)
-    mssql_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.20", port=1444, service="ms-sql-s"), state)
-    winrm_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.70", port=5986, service="wsmans"), state)
-    generic_nmap_commands = service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.93", port=12345, service="unknown"), state)
+    def flatten_cmds(cmds_dict):
+        return {k: [cmd for _, cmd in v] for k, v in cmds_dict.items()}
+
+    ftp_commands = flatten_cmds(service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.50", port=21, service="ftp"), state))
+    smb_commands = flatten_cmds(service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.60", port=139, service="netbios-ssn"), state))
+    rdp_commands = flatten_cmds(service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.30", port=3390, service="ms-wbt-server"), state))
+    ssh_commands = flatten_cmds(service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.50", port=2222, service="ssh"), state))
+    ldap_commands = flatten_cmds(service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.40", port=636, service="ldaps"), state))
+    kerberos_commands = flatten_cmds(service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.40", port=88, service="kerberos"), state))
+    mssql_commands = flatten_cmds(service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.20", port=1444, service="ms-sql-s"), state))
+    winrm_commands = flatten_cmds(service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.70", port=5986, service="wsmans"), state))
+    generic_nmap_commands = flatten_cmds(service_primary_commands_by_tool(ServiceRecord(ip="10.10.10.93", port=12345, service="unknown"), state))
     group_action_html = service_group_actions(
         "RDP",
         [
@@ -7629,7 +7921,7 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
         ("group-raw-copy-tool-loop", "for cmd in" in rdp_grouped_html and "birdscan-nmap_nse-all-targets.txt" in rdp_grouped_html, "aggregated RAW copy action should use a clean tool target loop"),
         ("raw-inline", "raw-details" in rdp_raw_inline_html and "RDP output one" in rdp_raw_inline_html and "Copiar comando" in rdp_raw_inline_html, "RAW output should render inline with command copy action"),
         ("gobuster-single-command", len(gobuster_commands) == 1, "Gobuster copy button should contain one command"),
-        ("ftp-copy-commands", any("ftp -inv -p 10.10.10.50 21" in command for command in ftp_commands.get("FTP anonymous", [])), "FTP anonymous command not generated as expected"),
+        ("ftp-copy-commands", any("ftp -inv -p 10.10.10.50 21" in command for command in ftp_commands.get("FTP anon", [])), "FTP anonymous command not generated as expected"),
         ("smb-port-commands", " -p 139" in " ".join(smb_commands.get("SMBClient", [])) and "-g" not in " ".join(smb_commands.get("SMBClient", [])) and "--port 139" in " ".join(smb_commands.get("NXC", [])) and "-port 139" in " ".join(smb_commands.get("Impacket", [])), "SMB commands do not carry the detected port or still have -g flag"),
         ("rdp-port-commands", "/v:10.10.10.30:3390" in " ".join(rdp_commands.get("XFreeRDP", [])) and "--port 3390" in " ".join(rdp_commands.get("NXC RDP", [])), "RDP commands do not carry the detected port"),
         ("ssh-port-command", "ssh -p 2222" in " ".join(ssh_commands.get("SSH", [])), "SSH command does not carry the detected port"),
@@ -7662,7 +7954,7 @@ def run_self_test(args: argparse.Namespace, logger: Logger) -> int:
         ("smbv1-detect-nmap", detect_smbv1_enabled("smb-protocols:\n  NT LM 0.12\n  2.0.2\n  3.0.2"), "detect_smbv1_enabled should detect NT LM 0.12 dialect"),
         ("smbv1-detect-false", not detect_smbv1_enabled("SMB 10.0.0.1 445 HOST SMBv1:False signing:True"), "detect_smbv1_enabled should return False when SMBv1 is disabled"),
         ("smbv1-parse-keywords", parse_smb_keywords("SMBv1:True signing: false")["smbv1_enabled"] is True and parse_smb_keywords("SMBv1:True signing: false")["severity"] == "high", "parse_smb_keywords should flag SMBv1 as high severity"),
-        ("impacket-no-inputfile", all("-inputfile" not in cmd for cmd in smb_commands.get("Impacket", [])) and "printf" in " ".join(smb_commands.get("Impacket", [])) and "|" in " ".join(smb_commands.get("Impacket", [])), "Impacket copy command should use pipe instead of inputfile"),
+        ("impacket-no-inputfile", all("-inputfile" not in cmd for cmd in smb_commands.get("Impacket", [])), "Impacket copy command should not use inputfile"),
         ("kerbrute-in-deps", "kerbrute" in DEPENDENCIES, "kerbrute should be in DEPENDENCIES list"),
         ("kerbrute-kerberos-commands", "Kerbrute userenum" in kerberos_commands and "kerbrute userenum" in " ".join(kerberos_commands.get("Kerbrute userenum", [])), "Kerberos commands should include kerbrute userenum"),
         ("kerbrute-passwordspray-commands", "Kerbrute passwordspray" in kerberos_commands and "kerbrute passwordspray" in " ".join(kerberos_commands.get("Kerbrute passwordspray", [])), "Kerberos commands should include kerbrute passwordspray"),
@@ -7709,9 +8001,11 @@ def main(argv: list[str]) -> int:
                     or args.kerberos
                     or args.username_file
                     or args.password_file
+                    or getattr(args, "ntlm_hash_file", None)
                 ),
                 "username_file": args.username_file or "",
                 "password_file": args.password_file or "",
+                "ntlm_hash_file": getattr(args, "ntlm_hash_file", None) or "",
                 "auth_attack_mode": getattr(args, "auth_attack_mode", "pitchfork") or "pitchfork",
                 "credential_lists_execute_automated_spray": has_automated_credential_spray(args),
                 "user_enum_enabled": bool(args.enable_user_enum),
@@ -7749,6 +8043,11 @@ def main(argv: list[str]) -> int:
             else:
                 run_web_catalog(args, state, logger)
                 run_service_enumeration(args, state, logger)
+            # Always run credential auth when credentials are supplied,
+            # regardless of --skip-web / --skip-service-enum flags.
+            if has_automated_credential_spray(args):
+                run_credential_auth_enumeration(args, state, logger)
+                save_state(state)
         derive_prioritized_findings(state)
         prune_suppressed_evidence(state)
         prune_unreportable_web_endpoints(state)
