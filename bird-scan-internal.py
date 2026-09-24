@@ -5292,6 +5292,10 @@ def generate_html_report(state: ScanState) -> Path:
       button.addEventListener('click', () => activateTab(button.dataset.tabTarget));
     }});
     document.addEventListener('click', event => {{
+      const details = event.target.closest('details.inline-web-list');
+      document.querySelectorAll('details.inline-web-list').forEach(d => {{
+        if (d !== details) d.removeAttribute('open');
+      }});
       const attentionButton = event.target.closest('[data-attention-toggle]');
       if (attentionButton) {{
         const panel = attentionButton.closest('.panel');
@@ -5314,6 +5318,8 @@ def generate_html_report(state: ScanState) -> Path:
         setTimeout(() => {{
           button.textContent = old;
           button.classList.remove('copied');
+          const parentDetails = button.closest('details.inline-web-list');
+          if (parentDetails) parentDetails.removeAttribute('open');
         }}, 1200);
       }};
       if (navigator.clipboard && window.isSecureContext) {{
@@ -6954,7 +6960,7 @@ def service_interaction_buttons(service: ServiceRecord, state: ScanState) -> str
             buttons.append(
                 f'<details class="inline-web-list" style="display:inline-block; vertical-align:top; margin-right:6px;">'
                 f'<summary class="copy-btn" style="padding:6px 9px; min-width:max-content;">{h(tool_label)} <span style="font-size:10px">({len(cmds)})▼</span></summary>'
-                f'<div style="position:absolute; background:var(--panel); border:1px solid var(--line); padding:8px; border-radius:6px; z-index:10; margin-top:4px;">{options}</div>'
+                f'<div style="position:absolute; background:var(--panel-solid); border:1px solid var(--line-strong); box-shadow: 0 10px 25px rgba(0,0,0,0.8); padding:8px; border-radius:6px; z-index:9999; margin-top:4px;">{options}</div>'
                 f'</details>'
             )
             
@@ -7069,7 +7075,7 @@ def service_primary_commands_by_tool(service: ServiceRecord, state: ScanState) -
             rpc_cmds.append(("-", f"rpcclient -U '' -N {shlex_quote(ip)} -p {port} -c srvinfo"))
             smbclient_cmds.append(("-", f"smbclient -L //{shlex_quote(ip)} -N -p {port}"))
             impacket_cmds.append(("-", f"impacket-smbclient -port {port} -no-pass {shlex_quote(ip)}"))
-            impacket_cmds.append(("-", f"impacket-rpcdump -port {port} -no-pass {shlex_quote(ip)}"))
+            impacket_cmds.append(("-", f"impacket-rpcdump -port {port} {shlex_quote(ip)}"))
         else:
             for cred in creds:
                 u, p, m, label = cred["username"], cred["password"], cred["method"], cred["label"]
@@ -7081,23 +7087,23 @@ def service_primary_commands_by_tool(service: ServiceRecord, state: ScanState) -
                     smbclient_cmds.append((label, f"smbclient -L //{shlex_quote(ip)} -U {shlex_quote(u)} -p {port}"))
                     imp_auth = f"{shlex_quote(u)}:{shlex_quote(p)}@{shlex_quote(ip)}"
                     impacket_cmds.append((f"{label} (smbclient)", f"impacket-smbclient -port {port} {imp_auth}"))
-                    impacket_cmds.append((f"{label} (wmiexec)", f"impacket-wmiexec -port {port} {imp_auth}"))
+                    impacket_cmds.append((f"{label} (wmiexec)", f"impacket-wmiexec {imp_auth}"))
                     impacket_cmds.append((f"{label} (psexec)", f"impacket-psexec -port {port} {imp_auth}"))
                     impacket_cmds.append((f"{label} (smbexec)", f"impacket-smbexec -port {port} {imp_auth}"))
-                    impacket_cmds.append((f"{label} (atexec)", f"impacket-atexec -port {port} {imp_auth} whoami"))
+                    impacket_cmds.append((f"{label} (atexec)", f"impacket-atexec {imp_auth} whoami"))
                     impacket_cmds.append((f"{label} (rpcdump)", f"impacket-rpcdump -port {port} {imp_auth}"))
                 else:
                     imp_auth = f"-hashes {shlex_quote(p)} {shlex_quote(u)}@{shlex_quote(ip)}"
                     impacket_cmds.append((f"{label} (smbclient)", f"impacket-smbclient -port {port} {imp_auth}"))
-                    impacket_cmds.append((f"{label} (wmiexec)", f"impacket-wmiexec -port {port} {imp_auth}"))
+                    impacket_cmds.append((f"{label} (wmiexec)", f"impacket-wmiexec {imp_auth}"))
                     impacket_cmds.append((f"{label} (psexec)", f"impacket-psexec -port {port} {imp_auth}"))
                     impacket_cmds.append((f"{label} (smbexec)", f"impacket-smbexec -port {port} {imp_auth}"))
-                    impacket_cmds.append((f"{label} (atexec)", f"impacket-atexec -port {port} {imp_auth} whoami"))
+                    impacket_cmds.append((f"{label} (atexec)", f"impacket-atexec {imp_auth} whoami"))
                     impacket_cmds.append((f"{label} (rpcdump)", f"impacket-rpcdump -port {port} {imp_auth}"))
                     pth_auth = f"{shlex_quote(u)}%{shlex_quote(p)}"
-                    pth_cmds.append((f"{label} (smbclient)", f"pth-smbclient -U {pth_auth} //{shlex_quote(ip)}/c$"))
+                    pth_cmds.append((f"{label} (smbclient)", f"pth-smbclient -U {pth_auth} -p {port} //{shlex_quote(ip)}/c$"))
                     pth_cmds.append((f"{label} (wmic)", f"pth-wmic -U {pth_auth} //{shlex_quote(ip)} 'select Name from Win32_UserAccount'"))
-                    pth_cmds.append((f"{label} (rpcclient)", f"pth-rpcclient -U {pth_auth} //{shlex_quote(ip)}"))
+                    pth_cmds.append((f"{label} (rpcclient)", f"pth-rpcclient -U {pth_auth} -p {port} //{shlex_quote(ip)}"))
 
         commands.update({
             "SMBClient": smbclient_cmds,
@@ -7114,16 +7120,16 @@ def service_primary_commands_by_tool(service: ServiceRecord, state: ScanState) -
         nxc_cmds = []
         if not creds:
             xfreerdp_cmds.append(("-", f"xfreerdp /v:{ip}:{port} /cert:ignore /dynamic-resolution"))
-            nxc_cmds.append(("-", f"nxc rdp {shlex_quote(ip)} --port {port} --screendump"))
+            nxc_cmds.append(("-", f"nxc rdp {shlex_quote(ip)} --port {port} --screenshot"))
         else:
             for cred in creds:
                 u, p, m, label = cred["username"], cred["password"], cred["method"], cred["label"]
                 if m == "password":
                     xfreerdp_cmds.append((label, f"xfreerdp /v:{ip}:{port} /cert:ignore /dynamic-resolution /u:{shlex_quote(u)} /p:{shlex_quote(p)}"))
-                    nxc_cmds.append((label, f"nxc rdp {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -p {shlex_quote(p)} --screendump"))
+                    nxc_cmds.append((label, f"nxc rdp {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -p {shlex_quote(p)} --screenshot"))
                 else:
                     xfreerdp_cmds.append((label, f"xfreerdp /v:{ip}:{port} /cert:ignore /dynamic-resolution /u:{shlex_quote(u)} /pth:{shlex_quote(p)}"))
-                    nxc_cmds.append((label, f"nxc rdp {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -H {shlex_quote(p)} --screendump"))
+                    nxc_cmds.append((label, f"nxc rdp {shlex_quote(ip)} --port {port} -u {shlex_quote(u)} -H {shlex_quote(p)} --screenshot"))
 
         commands.update({
             "XFreeRDP": xfreerdp_cmds,
@@ -7176,8 +7182,8 @@ def service_primary_commands_by_tool(service: ServiceRecord, state: ScanState) -
         realm = "DOMAIN.LOCAL"
         kerbrute_wordlist = "/usr/share/seclists/Usernames/xato-net-10-million-usernames.txt"
         commands["KRB5 info"] = [("-", f"nmap -sV -Pn -p {port} --script krb5-info {shlex_quote(ip)}")]
-        commands["Kerbrute userenum"] = [("-", f"kerbrute userenum --dc {shlex_quote(ip)}:{port} -d {realm} {shlex_quote(kerbrute_wordlist)}")]
-        commands["Kerbrute passwordspray"] = [("-", f"kerbrute passwordspray --dc {shlex_quote(ip)}:{port} -d {realm} {shlex_quote(kerbrute_wordlist)} Senha123!")]
+        commands["Kerbrute userenum"] = [("-", f"kerbrute userenum --dc {shlex_quote(ip)} -d {realm} {shlex_quote(kerbrute_wordlist)}")]
+        commands["Kerbrute passwordspray"] = [("-", f"kerbrute passwordspray --dc {shlex_quote(ip)} -d {realm} {shlex_quote(kerbrute_wordlist)} Senha123!")]
         commands["Impacket GetNPUsers"] = [("-", f"impacket-GetNPUsers {realm}/ -no-pass -usersfile lista-de-user-valido.txt -format hashcat -outputfile hashes-found.txt -dc-ip {shlex_quote(ip)}")]
         return commands
     if group == "DATABASE/DATA":
