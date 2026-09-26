@@ -137,6 +137,7 @@ DEPENDENCIES = [
     "swaks",
     "vncviewer",
     "kerbrute",
+    "pth-winexe",
 ]
 
 DEPENDENCY_PACKAGES = {
@@ -170,6 +171,7 @@ DEPENDENCY_PACKAGES = {
     "swaks": "swaks",
     "vncviewer": "tigervnc-viewer",
     "kerbrute": "kerbrute",
+    "pth-winexe": "passing-the-hash",
 }
 
 SMB_PORTS = {139, 445}
@@ -1814,8 +1816,8 @@ def run_nmap_discovery(args: argparse.Namespace, state: ScanState, targets: list
         is_custom_command = True
         custom_command_str = targets[0].strip()
         logger.info(f"Custom Nmap command detected: {custom_command_str}")
-        import shlex
-        import re
+        import shlex as _shlex  # noqa: F811 — local re-import for clarity in custom command parsing
+        import re as _re  # noqa: F811
         command = shlex.split(custom_command_str)
         match = re.search(r'-o[NXGA]\s+([^\s]+)', custom_command_str)
         if match:
@@ -3025,9 +3027,6 @@ def build_credential_pairs(args: argparse.Namespace) -> tuple[list[CredentialPai
         return [], mode
     if not users:
         users = [""]
-
-    if not users:
-        return [], mode
     pairs: list[CredentialPair] = []
     if mode == "pitchfork":
         for domain in domains:
@@ -3179,6 +3178,8 @@ def auth_protocols_for_service(service: ServiceRecord) -> list[tuple[str, str]]:
             protocols.append(("smb", "nxc"))
         if has_tool("crackmapexec"):
             protocols.append(("smb", "crackmapexec"))
+        if has_tool("pth-winexe"):
+            protocols.append(("smb", "pth-winexe"))
     elif group == "LDAP/AD":
         if has_tool("nxc"):
             protocols.append(("ldap", "nxc"))
@@ -3287,6 +3288,42 @@ def run_crackmapexec_auth_attempt(
     )
 
 
+def run_pth_winexe_auth_attempt(
+    args: argparse.Namespace,
+    state: ScanState,
+    logger: Logger,
+    raw_dir: Path,
+    service: ServiceRecord,
+    pair: CredentialPair,
+    mode: str,
+    uses_hash: bool,
+) -> None:
+    if not pair.username:
+        return
+    pth_auth = f"{pair.domain + '/' if pair.domain else ''}{pair.username}%{pair.password or ''}"
+    command = ["pth-winexe", "-U", pth_auth, f"//{service.ip}", "ipconfig"]
+    slug = safe_filename(f"{pair.username}_{pair.password or 'hash'}")
+    output_file = raw_dir / f"pth_winexe_{safe_filename(service.ip)}_{service.port}_{slug}.txt"
+    secrets = [pair.password] if pair.password else []
+    result = run_service_command(command, output_file, args, logger, secrets)
+    
+    success = result.returncode == 0 and ("Windows IP" in result.stdout or "IPv4" in result.stdout or "ipconfig" in result.stdout.lower())
+    record_auth_attempt_evidence(
+        state,
+        service,
+        category="smb",
+        protocol="smb",
+        tool="pth-winexe",
+        pair=pair,
+        mode=mode,
+        success=success,
+        command=shell_join(redact_command(command, secrets)),
+        raw_output_file=relpath(result.output_file or "", state.output_dir),
+        transcript=result.stdout + result.stderr,
+        uses_hash=uses_hash,
+    )
+
+
 def run_postgres_auth_attempt(
     args: argparse.Namespace,
     state: ScanState,
@@ -3370,13 +3407,17 @@ def run_credential_auth_enumeration(args: argparse.Namespace, state: ScanState, 
     for service in services:
         for pair in pairs:
             for protocol, tool in auth_protocols_for_service(service):
-                # Skip non-NTLM-capable tools when using hash-only auth
-                if uses_hash and tool in {"psql"} or (uses_hash and tool == "native" and protocol == "ftp"):
+                # Skip tools incompatible with current auth method
+                if not pair.is_hash and tool == "pth-winexe":
+                    continue
+                if (pair.is_hash and tool in {"psql"}) or (pair.is_hash and tool == "native" and protocol == "ftp"):
                     continue
                 if tool == "nxc":
-                    run_nxc_auth_attempt(args, state, logger, raw_dir, service, protocol, pair, mode, uses_hash)
+                    run_nxc_auth_attempt(args, state, logger, raw_dir, service, protocol, pair, mode, pair.is_hash)
                 elif tool == "crackmapexec":
-                    run_crackmapexec_auth_attempt(args, state, logger, raw_dir, service, pair, mode, uses_hash)
+                    run_crackmapexec_auth_attempt(args, state, logger, raw_dir, service, pair, mode, pair.is_hash)
+                elif tool == "pth-winexe":
+                    run_pth_winexe_auth_attempt(args, state, logger, raw_dir, service, pair, mode, pair.is_hash)
                 elif tool == "psql":
                     run_postgres_auth_attempt(args, state, logger, raw_dir, service, pair, mode)
                 elif tool == "native" and protocol == "ftp":
@@ -3940,7 +3981,7 @@ def run_kerbrute_user_enum(args: argparse.Namespace, state: ScanState, logger: L
         port = service.port
         for realm in realms:
             dsuffix = f"_{safe_filename(realm)}"
-            command = ["kerbrute", "userenum", "--dc", f"{ip}:{port}", "-d", realm, str(wordlist)]
+            command = ["kerbrute", "userenum", "--dc", ip, "-d", realm, str(wordlist)]
             result = run_service_command(command, raw_dir / f"kerbrute_userenum_{safe_filename(ip)}_{port}{dsuffix}.txt", args, logger, [])
             parsed = parse_kerbrute_results(result.stdout + result.stderr)
             add_tool_evidence(state, "kerberos", ip, port, "kerbrute userenum", result, parsed)
@@ -4046,7 +4087,7 @@ def add_tool_evidence(
             service=category,
             title=title,
             description=description,
-            command=shell_join(result.command),
+            command=shell_join(result.redacted_command),
             raw_output_file=relpath(result.output_file or "", state.output_dir),
             severity=severity,
             data=parsed,
@@ -6958,9 +6999,9 @@ def service_interaction_buttons(service: ServiceRecord, state: ScanState) -> str
             options = "".join(f'<div style="margin-bottom:4px">{copy_commands_button(cmd_label, [cmd_text])}</div>' for cmd_label, cmd_text in cmds)
             # Add a dropdown button for multiple commands
             buttons.append(
-                f'<details class="inline-web-list" style="display:inline-block; vertical-align:top; margin-right:6px;">'
+                f'<details class="inline-web-list" style="position:relative; display:inline-block; vertical-align:top; margin-right:6px;">'
                 f'<summary class="copy-btn" style="padding:6px 9px; min-width:max-content;">{h(tool_label)} <span style="font-size:10px">({len(cmds)})▼</span></summary>'
-                f'<div style="position:absolute; background:var(--panel-solid); border:1px solid var(--line-strong); box-shadow: 0 10px 25px rgba(0,0,0,0.8); padding:8px; border-radius:6px; z-index:9999; margin-top:4px;">{options}</div>'
+                f'<div style="position:absolute; right:0; min-width:max-content; background:var(--panel-solid); border:1px solid var(--line-strong); box-shadow: 0 10px 25px rgba(0,0,0,0.8); padding:8px; border-radius:6px; z-index:9999; margin-top:4px;">{options}</div>'
                 f'</details>'
             )
             
@@ -7070,8 +7111,8 @@ def service_primary_commands_by_tool(service: ServiceRecord, state: ScanState) -
         pth_cmds = []
         
         if not creds:
-            nxc_cmds.append(("-", f"nxc smb {shlex_quote(ip)} --port {port} --users --disks --shares -x whoami"))
-            cme_cmds.append(("-", f"crackmapexec smb {shlex_quote(ip)} --port {port} --users --disks --shares -x whoami"))
+            nxc_cmds.append(("-", f"nxc smb {shlex_quote(ip)} --port {port} --users --disks --shares"))
+            cme_cmds.append(("-", f"crackmapexec smb {shlex_quote(ip)} --port {port} --users --disks --shares"))
             rpc_cmds.append(("-", f"rpcclient -U '' -N {shlex_quote(ip)} -p {port} -c srvinfo"))
             smbclient_cmds.append(("-", f"smbclient -L //{shlex_quote(ip)} -N -p {port}"))
             impacket_cmds.append(("-", f"impacket-smbclient -port {port} -no-pass {shlex_quote(ip)}"))
@@ -7104,6 +7145,7 @@ def service_primary_commands_by_tool(service: ServiceRecord, state: ScanState) -
                     pth_cmds.append((f"{label} (smbclient)", f"pth-smbclient -U {pth_auth} -p {port} //{shlex_quote(ip)}/c$"))
                     pth_cmds.append((f"{label} (wmic)", f"pth-wmic -U {pth_auth} //{shlex_quote(ip)} 'select Name from Win32_UserAccount'"))
                     pth_cmds.append((f"{label} (rpcclient)", f"pth-rpcclient -U {pth_auth} -p {port} //{shlex_quote(ip)}"))
+                    pth_cmds.append((f"{label} (winexe)", f"pth-winexe -U {pth_auth} //{shlex_quote(ip)} cmd.exe"))
 
         commands.update({
             "SMBClient": smbclient_cmds,
