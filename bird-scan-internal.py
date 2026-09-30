@@ -4283,6 +4283,37 @@ def write_cifs_credentials_file(credential: dict[str, str]) -> Path | None:
     return path
 
 
+def reusable_cifs_mount_command(
+    ip: str,
+    port: int,
+    share: str,
+    mount_dir: str | Path,
+    credential: dict[str, str],
+) -> str:
+    """Build a reusable mount command for password or guest SMB access."""
+    method = normalize_auth_method(credential.get("method", ""), username=credential.get("username", ""))
+    if method == "hash":
+        return ""
+    options = [f"port={port}"]
+    if method == "anonymous":
+        options.append("guest")
+        mount = "sudo mount"
+    else:
+        username = credential.get("username", "")
+        if not username:
+            return ""
+        options.append(f"username={username}")
+        if credential.get("domain"):
+            options.append(f"domain={credential['domain']}")
+        mount = f"sudo env PASSWD={shlex_quote(credential.get('password', ''))} mount"
+    destination = shlex_quote(str(mount_dir))
+    source = shlex_quote(f"//{ip}/{share}")
+    return (
+        f"sudo mkdir -p {destination} && {mount} -t cifs {source} {destination} "
+        f"-o {shlex_quote(','.join(options))}"
+    )
+
+
 def run_smb_share_mapping(args: argparse.Namespace, state: ScanState, logger: Logger) -> None:
     base_dir = Path(args.map_shares or "/tmp/shares")
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -4426,6 +4457,7 @@ def run_smb_share_mapping(args: argparse.Namespace, state: ScanState, logger: Lo
                 identity_count = identity_counts.get(identity, 1)
                 directory_name = smb_mapping_directory_name(ip, service.port, credential, identity_count)
                 share_dir = base_dir / directory_name / safe_filename(share)
+                mount_command = reusable_cifs_mount_command(ip, service.port, share, share_dir, credential)
                 can_mount = method in {"password", "anonymous", "null"} and has_tool("mount.cifs")
                 mount_prefix: list[str] = []
                 if hasattr(os, "geteuid") and os.geteuid() != 0:
@@ -4491,6 +4523,7 @@ def run_smb_share_mapping(args: argparse.Namespace, state: ScanState, logger: Lo
                         "validation_command": shell_join(validation_cmd),
                         "validation_output_file": relpath(validation_result.output_file or "", state.output_dir),
                         "interaction_command": interaction_command,
+                        "mount_command": mount_command,
                     }
                 )
 
@@ -8752,9 +8785,10 @@ def validated_smb_share_actions(
     from offering commands for shares that merely appeared in a browse list.
     """
     smbclient_actions: list[tuple[str, str]] = []
-    mounted_actions: list[tuple[str, str]] = []
+    mount_actions: list[tuple[str, str]] = []
     seen_commands: set[str] = set()
-    seen_paths: set[str] = set()
+    seen_mount_commands: set[str] = set()
+    credentials = smb_auth_credentials_for_service(state, service)
     for item in state.evidence:
         if (
             item.category != "smb"
@@ -8780,11 +8814,42 @@ def validated_smb_share_actions(
             if command and command not in seen_commands:
                 seen_commands.add(command)
                 smbclient_actions.append((label, command))
-            path = str(share.get("path") or "").strip()
-            if share.get("mounted") and path and path not in seen_paths:
-                seen_paths.add(path)
-                mounted_actions.append((f"{label} — caminho montado", f"cd {shlex_quote(path)}"))
-    return smbclient_actions, mounted_actions
+            mount_command = str(share.get("mount_command") or "").strip()
+            if not mount_command:
+                credential_id = str(item.data.get("credential_id") or "")
+                username = str(item.data.get("username") or "")
+                domain = str(item.data.get("domain") or "")
+                method = normalize_auth_method(str(item.data.get("auth_method") or ""), username=username)
+                credential = next(
+                    (
+                        candidate
+                        for candidate in credentials
+                        if (credential_id and credential_fingerprint(candidate) == credential_id)
+                        or (
+                            candidate.get("username", "") == username
+                            and candidate.get("domain", "") == domain
+                            and normalize_auth_method(candidate.get("method", ""), username=candidate.get("username", "")) == method
+                        )
+                    ),
+                    None,
+                )
+                path = str(share.get("path") or "").strip()
+                if not path:
+                    mapping_root = str(item.data.get("mapping_root") or "").strip()
+                    if mapping_root:
+                        path = str(Path(mapping_root) / safe_filename(share_name))
+                if credential and path:
+                    mount_command = reusable_cifs_mount_command(
+                        service.ip,
+                        service.port,
+                        share_name,
+                        path,
+                        credential,
+                    )
+            if mount_command and mount_command not in seen_mount_commands:
+                seen_mount_commands.add(mount_command)
+                mount_actions.append((f"{label} — montar novamente", mount_command))
+    return smbclient_actions, mount_actions
 
 
 def ntlm_relay_commands(ip: str) -> list[tuple[str, str]]:
