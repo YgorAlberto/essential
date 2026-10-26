@@ -3,8 +3,8 @@
 
 set -u
 
-VERSION="1.4.0"
-REFRESH_SECONDS="${SENTINEL_REFRESH:-20}"
+VERSION="1.5.0"
+REFRESH_SECONDS="${SENTINEL_REFRESH:-10}"
 MAX_ROWS="${SENTINEL_ROWS:-0}"
 CONNECTION_FILTER=""
 NETWORK_INTERFACES="wlan0,eth0"
@@ -14,13 +14,21 @@ TMP_DIR=""
 TMUX_SOCKET=""
 STOPPED=0
 STARTED=0
+ACTIVE_SLEEP_PID=""
 declare -A PANEL_V PANEL_H
 PANEL_ORDER=(resources persistence connections command)
 ACTIVE_PANEL=0
+ACTIVE_COMMAND_PID=""
+PREVIOUS_CPU_TOTAL=0
+PREVIOUS_CPU_IDLE=0
+CPU_USAGE="coletando"
+PREVIOUS_PROCESS_TIME=0
+PROCESS_GPU_NS=""
+declare -A PREVIOUS_PROCESS_TICKS PREVIOUS_PROCESS_START PREVIOUS_PROCESS_GPU_NS
 MISSING_TOOLS=()
 NEED_CORE=0; NEED_AWK=0; NEED_SED=0; NEED_GREP=0; NEED_FIND=0
 NEED_PROCPS=0; NEED_TPUT=0; NEED_NETWORK=0; NEED_DNS=0; NEED_HTTP=0
-NEED_TMUX=0; NEED_HTOP=0
+NEED_TMUX=0; NEED_HTOP=0; NEED_SETSID=0
 DNS_RESULT_IP=""
 DNS_RESULT_MS=""
 
@@ -38,6 +46,17 @@ fi
 cleanup() {
   STOPPED=1
   trap - INT TERM EXIT
+  if [[ -n "$ACTIVE_SLEEP_PID" ]]; then
+    kill "$ACTIVE_SLEEP_PID" >/dev/null 2>&1 || true
+    wait "$ACTIVE_SLEEP_PID" 2>/dev/null || true
+    ACTIVE_SLEEP_PID=""
+  fi
+  if [[ -n "$ACTIVE_COMMAND_PID" ]]; then
+    kill -TERM -- "-$ACTIVE_COMMAND_PID" >/dev/null 2>&1 || true
+    kill -KILL -- "-$ACTIVE_COMMAND_PID" >/dev/null 2>&1 || true
+    wait "$ACTIVE_COMMAND_PID" 2>/dev/null || true
+    ACTIVE_COMMAND_PID=""
+  fi
   if [[ -n "$TMUX_SOCKET" ]] && command -v tmux >/dev/null 2>&1 && [[ -S "$TMUX_SOCKET" ]]; then
     tmux -S "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
   fi
@@ -47,12 +66,14 @@ cleanup() {
     printf '\nSentinel encerrado; coletores e arquivos temporários removidos.\n'
   fi
 }
-trap cleanup INT TERM EXIT
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 usage() {
   cat <<EOF
 Uso: ${0##*/} [opções]
-  -i SEG   intervalo de atualização (padrão e mínimo: 20 segundos)
+  -i SEG   intervalo de atualização (padrão e mínimo: 10 segundos)
   -r N     altura-base dos quadros (0 = automático)
   -f LISTA nomes a ocultar nas conexões, separados por vírgula
            exemplo: -f firefox,mega,antigravity
@@ -84,7 +105,7 @@ while getopts ":i:r:f:n:d:p:c:h" opt; do
 done
 [[ "$REFRESH_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "Intervalo inválido" >&2; exit 2; }
 refresh_whole="${REFRESH_SECONDS%%.*}"
-((10#$refresh_whole >= 20)) || { echo "O intervalo mínimo é 20 segundos" >&2; exit 2; }
+((10#$refresh_whole >= 10)) || { echo "O intervalo mínimo é 10 segundos" >&2; exit 2; }
 [[ "$MAX_ROWS" =~ ^[0-9]+$ ]] || { echo "Número de linhas inválido" >&2; exit 2; }
 [[ -n "$DNS_TEST_HOST" && "$DNS_TEST_HOST" != -* && "$DNS_TEST_HOST" =~ ^[[:alnum:]_.-]+$ ]] || {
   echo "Nome para teste DNS inválido" >&2; exit 2;
@@ -98,7 +119,7 @@ scan_dependencies() {
   MISSING_TOOLS=()
   NEED_CORE=0; NEED_AWK=0; NEED_SED=0; NEED_GREP=0; NEED_FIND=0
   NEED_PROCPS=0; NEED_TPUT=0; NEED_NETWORK=0; NEED_DNS=0; NEED_HTTP=0
-  NEED_TMUX=0; NEED_HTOP=0
+  NEED_TMUX=0; NEED_HTOP=0; NEED_SETSID=0
 
   for tool in sort head cut paste who date getconf df readlink tr timeout tail sleep mktemp rm; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -115,13 +136,12 @@ scan_dependencies() {
     fi
   done
   command -v tput >/dev/null 2>&1 || { MISSING_TOOLS+=(tput); NEED_TPUT=1; }
+  command -v setsid >/dev/null 2>&1 || { MISSING_TOOLS+=(setsid); NEED_SETSID=1; }
   if ! command -v ip >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
     MISSING_TOOLS+=(ip/ss); NEED_NETWORK=1
   fi
   command -v getent >/dev/null 2>&1 || { MISSING_TOOLS+=(getent); NEED_DNS=1; }
-  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    MISSING_TOOLS+=(curl/wget); NEED_HTTP=1
-  fi
+  command -v curl >/dev/null 2>&1 || { MISSING_TOOLS+=(curl); NEED_HTTP=1; }
 
   command_name="${CUSTOM_COMMAND#"${CUSTOM_COMMAND%%[![:space:]]*}"}"
   command_name="${command_name%%[[:space:]]*}"
@@ -194,6 +214,7 @@ install_missing_dependencies() {
       ((NEED_HTTP)) && packages+=(curl)
       ((NEED_TMUX)) && packages+=(tmux)
       ((NEED_HTOP)) && packages+=(htop)
+      ((NEED_SETSID)) && packages+=(util-linux)
       printf 'Sentinel: preparando dependências com apt...\n' >&2
       "${elevate[@]}" apt-get update || printf 'Sentinel: aviso: não foi possível atualizar o índice do apt; tentando instalar mesmo assim.\n' >&2
       "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y -- "${packages[@]}" || return 1
@@ -211,6 +232,7 @@ install_missing_dependencies() {
       ((NEED_HTTP)) && packages+=(curl)
       ((NEED_TMUX)) && packages+=(tmux)
       ((NEED_HTOP)) && packages+=(htop)
+      ((NEED_SETSID)) && packages+=(util-linux)
       printf 'Sentinel: preparando dependências com %s...\n' "$manager" >&2
       "${elevate[@]}" "$manager" install -y "${packages[@]}" || return 1
       ;;
@@ -227,6 +249,7 @@ install_missing_dependencies() {
       ((NEED_HTTP)) && packages+=(curl)
       ((NEED_TMUX)) && packages+=(tmux)
       ((NEED_HTOP)) && packages+=(htop)
+      ((NEED_SETSID)) && packages+=(util-linux)
       printf 'Sentinel: preparando dependências com pacman...\n' >&2
       "${elevate[@]}" pacman -S --needed --noconfirm "${packages[@]}" || return 1
       ;;
@@ -243,6 +266,7 @@ install_missing_dependencies() {
       ((NEED_HTTP)) && packages+=(curl)
       ((NEED_TMUX)) && packages+=(tmux)
       ((NEED_HTOP)) && packages+=(htop)
+      ((NEED_SETSID)) && packages+=(util-linux)
       printf 'Sentinel: preparando dependências com zypper...\n' >&2
       "${elevate[@]}" zypper --non-interactive install "${packages[@]}" || return 1
       ;;
@@ -259,6 +283,7 @@ install_missing_dependencies() {
       ((NEED_HTTP)) && packages+=(curl)
       ((NEED_TMUX)) && packages+=(tmux)
       ((NEED_HTOP)) && packages+=(htop)
+      ((NEED_SETSID)) && packages+=(util-linux-misc)
       printf 'Sentinel: preparando dependências com apk...\n' >&2
       "${elevate[@]}" apk add "${packages[@]}" || return 1
       ;;
@@ -431,6 +456,229 @@ detect_fans() {
   fi
 }
 
+read_cpu_usage() {
+  local total idle delta_total delta_idle
+  read -r total idle < <(awk '/^cpu / {total=0; for(i=2;i<=NF;i++) total+=$i; print total, $5+$6; exit}' /proc/stat)
+  if ((PREVIOUS_CPU_TOTAL > 0 && total > PREVIOUS_CPU_TOTAL)); then
+    delta_total=$((total-PREVIOUS_CPU_TOTAL)); delta_idle=$((idle-PREVIOUS_CPU_IDLE))
+    CPU_USAGE=$(awk -v total="$delta_total" -v idle="$delta_idle" 'BEGIN {
+      busy=100*(total-idle)/total
+      if(busy<0) busy=0; if(busy>100) busy=100
+      printf "%d%%", int(busy+0.5)
+    }')
+  else
+    CPU_USAGE='coletando'
+  fi
+  PREVIOUS_CPU_TOTAL="$total"; PREVIOUS_CPU_IDLE="$idle"
+}
+
+read_gpu_usage() {
+  local output path value total=0 count=0
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    output=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true)
+    if [[ -n "$output" ]]; then
+      value=$(awk '/^[[:space:]]*[0-9]+([.][0-9]+)?[[:space:]]*$/ {
+        gsub(/[[:space:]]/, ""); total+=$1; count++
+      } END {if(count) printf "%d%%", int(total/count+0.5)}' <<< "$output")
+      if [[ -n "$value" ]]; then
+        printf '%s' "$value"
+        return
+      fi
+    fi
+  fi
+
+  for path in /sys/class/drm/card[0-9]*/device/gpu_busy_percent; do
+    [[ -r "$path" ]] || continue
+    IFS= read -r value < "$path" || continue
+    [[ "$value" =~ ^[0-9]+$ ]] || continue
+    ((value<0 || value>100)) && continue
+    total=$((total+value)); ((count+=1))
+  done
+  if ((count>0)); then
+    awk -v total="$total" -v count="$count" 'BEGIN {printf "%d%%", int(total/count+0.5)}'
+  else
+    printf 'N/D'
+  fi
+}
+
+print_usage_bar() {
+  local label="$1" value="$2" numeric="${2%%%}"
+  if [[ "$numeric" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    numeric=$(awk -v n="$numeric" 'BEGIN {printf "%d", int(n+0.5)}')
+    value="${numeric}%"
+    printf '%-5s %6s  ' "$label" "$value"
+    bar "$numeric" 18
+    printf '\n'
+  elif [[ "$label" == CPU && "$value" == coletando ]]; then
+    printf '%-5s %6s  ' "$label" "$value"
+    bar 0 18
+    printf '\n'
+  else
+    printf '%-5s %6s\n' "$label" "$value"
+  fi
+}
+
+read_process_gpu_time() {
+  local pid="$1" fdinfo line total=0 found=0
+  PROCESS_GPU_NS=""
+  for fdinfo in /proc/"$pid"/fdinfo/*; do
+    [[ -r "$fdinfo" ]] || continue
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^drm-engine-[^:]+:[[:space:]]*([0-9]+)[[:space:]]+ns ]]; then
+        total=$((total+BASH_REMATCH[1])); found=1
+      fi
+    done < "$fdinfo" 2>/dev/null
+  done
+  ((found)) && PROCESS_GPU_NS="$total"
+}
+
+process_app_name() {
+  local pid="$1" comm="$2" exe base cmd lower candidate
+  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+  base="${exe##*/}"
+  [[ -n "$base" ]] || base="$comm"
+  base="${base% (deleted)}"
+  # A process can exit between ps and this read; suppress the shell's own
+  # redirection error as well as tr's stderr, then fall back to comm/exe.
+  cmd=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null) || cmd=""
+  lower="${base,,} ${comm,,} ${cmd,,}"
+
+  case "$lower" in
+    *burpsuite*|*burp_suite*) printf 'BurpSuite'; return ;;
+    *virtualboxvm*|*vboxheadless*|*vboxsvc*|*virtualbox*) printf 'VirtualBox'; return ;;
+    *google-chrome*|*chromium*|*/chrome\ *|chrome\ *|*isolated*)
+      [[ "${base,,}" =~ (chrome|chromium) || "${comm,,}" == isolated ]] && { printf 'Chrome'; return; } ;;
+    *firefox*) printf 'Firefox'; return ;;
+    *brave*) printf 'Brave'; return ;;
+    *msedge*|*microsoft-edge*) printf 'Edge'; return ;;
+    *code\ *|*/code|*visual\ studio\ code*) printf 'VS Code'; return ;;
+    *java*)
+      if [[ "$lower" =~ -jar[[:space:]]+([^[:space:]]+) ]]; then
+        candidate="${BASH_REMATCH[1]##*/}"
+        candidate="${candidate%.jar}"
+        printf '%s' "${candidate:0:18}"; return
+      fi
+      if [[ "$lower" =~ ([[:alnum:]_.]+main) ]]; then
+        candidate="${BASH_REMATCH[1]##*.}"
+        printf 'Java:%s' "${candidate:0:12}"; return
+      fi
+      printf 'Java'; return ;;
+  esac
+
+  candidate="$base"
+  candidate="${candidate%.bin}"
+  candidate="${candidate%.x86_64}"
+  candidate="${candidate%.x86}"
+  [[ -n "$candidate" && "$candidate" != *'('* ]] || candidate="$comm"
+  [[ -n "$candidate" ]] || candidate='desconhecido'
+  printf '%s' "${candidate:0:18}"
+}
+
+collect_top_processes() {
+  local pid cpu_pct ram_pct comm app gpu_pct score stat_line stat_rest ticks start_tick now elapsed tick_rate
+  local -A gpu_by_pid=() app_cpu=() app_ram=() app_gpu=() app_gpu_count=() app_count=()
+  local -A current_process_ticks=() current_process_start=() current_process_gpu_ns=()
+  local -a rows=() stat_fields=()
+  local gpu_sample="$TMP_DIR/gpu_usage" process_rows="$TMP_DIR/processes.raw"
+
+  : > "$gpu_sample"; : > "$process_rows"
+  now=$(date +%s)
+  elapsed=$((PREVIOUS_PROCESS_TIME > 0 ? now-PREVIOUS_PROCESS_TIME : 0))
+  tick_rate=$(getconf CLK_TCK 2>/dev/null || printf '100')
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    timeout 3s nvidia-smi pmon -c 1 -s um 2>/dev/null |
+      awk '$2 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+([.][0-9]+)?$/ {print $2 "\t" $4}' > "$gpu_sample" || true
+    while IFS=$'\t' read -r pid gpu_pct; do
+      [[ "$pid" =~ ^[0-9]+$ && "$gpu_pct" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+      gpu_by_pid[$pid]="$gpu_pct"
+    done < "$gpu_sample"
+  fi
+
+  while read -r pid cpu_pct ram_pct comm; do
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+    [[ -r "/proc/$pid/cmdline" ]] || continue
+    stat_line=""
+    IFS= read -r stat_line < "/proc/$pid/stat" 2>/dev/null || continue
+    stat_rest="${stat_line##*) }"
+    stat_fields=()
+    read -r -a stat_fields <<< "$stat_rest"
+    ((${#stat_fields[@]} >= 20)) || continue
+    ticks=$((stat_fields[11]+stat_fields[12])); start_tick="${stat_fields[19]}"
+    current_process_ticks[$pid]="$ticks"; current_process_start[$pid]="$start_tick"
+    if ((elapsed > 0 && tick_rate > 0)) &&
+      [[ -n "${PREVIOUS_PROCESS_START[$pid]:-}" && "${PREVIOUS_PROCESS_START[$pid]}" == "$start_tick" ]]; then
+      cpu_pct=$(awk -v current="$ticks" -v previous="${PREVIOUS_PROCESS_TICKS[$pid]}" \
+        -v seconds="$elapsed" -v rate="$tick_rate" \
+        'BEGIN {value=(current-previous)*100/(seconds*rate); if(value<0)value=0; printf "%.2f",value}')
+    fi
+    app=$(process_app_name "$pid" "$comm")
+    case "${app,,}" in
+      bash|sh|zsh|ps|awk|sed|grep|curl|wget|timeout|getent|sort|head|cut|tr|sleep|top|tmux|systemd|kworker*) continue ;;
+    esac
+    [[ "$cpu_pct" =~ ^[0-9]+([.][0-9]+)?$ ]] || cpu_pct=0
+    [[ "$ram_pct" =~ ^[0-9]+([.][0-9]+)?$ ]] || ram_pct=0
+    gpu_pct="${gpu_by_pid[$pid]:-}"
+    if [[ -z "$gpu_pct" ]]; then
+      read_process_gpu_time "$pid"
+      if [[ "$PROCESS_GPU_NS" =~ ^[0-9]+$ ]]; then
+        current_process_gpu_ns[$pid]="$PROCESS_GPU_NS"
+        if ((elapsed > 0)) && [[ -n "${PREVIOUS_PROCESS_GPU_NS[$pid]:-}" &&
+          "${PREVIOUS_PROCESS_START[$pid]:-}" == "$start_tick" ]]; then
+          gpu_pct=$(awk -v current="$PROCESS_GPU_NS" -v previous="${PREVIOUS_PROCESS_GPU_NS[$pid]}" \
+            -v seconds="$elapsed" 'BEGIN {value=(current-previous)/(seconds*10000000); if(value<0)value=0; if(value>100)value=100; printf "%.0f",value}')
+        fi
+      fi
+    fi
+    if [[ -z "$gpu_pct" ]]; then
+      gpu_pct="N/D"
+    else
+      gpu_pct="${gpu_pct%.*}"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$app" "$cpu_pct" "$ram_pct" "$gpu_pct" >> "$process_rows"
+  done < <(ps -eo pid=,pcpu=,pmem=,comm= --sort=-pcpu 2>/dev/null)
+  PREVIOUS_PROCESS_TICKS=(); PREVIOUS_PROCESS_START=(); PREVIOUS_PROCESS_GPU_NS=()
+  for pid in "${!current_process_ticks[@]}"; do
+    PREVIOUS_PROCESS_TICKS[$pid]="${current_process_ticks[$pid]}"
+    PREVIOUS_PROCESS_START[$pid]="${current_process_start[$pid]}"
+    if [[ -n "${current_process_gpu_ns[$pid]:-}" ]]; then
+      PREVIOUS_PROCESS_GPU_NS[$pid]="${current_process_gpu_ns[$pid]}"
+    fi
+  done
+  PREVIOUS_PROCESS_TIME="$now"
+
+  while IFS=$'\t' read -r app cpu_pct ram_pct gpu_pct; do
+    [[ -n "$app" ]] || continue
+    app_cpu[$app]=$(awk -v a="${app_cpu[$app]:-0}" -v b="$cpu_pct" 'BEGIN {printf "%.2f", a+b}')
+    app_ram[$app]=$(awk -v a="${app_ram[$app]:-0}" -v b="$ram_pct" 'BEGIN {printf "%.2f", a+b}')
+    app_count[$app]=$(( ${app_count[$app]:-0} + 1 ))
+    if [[ "$gpu_pct" != 'N/D' ]]; then
+      app_gpu[$app]=$(awk -v a="${app_gpu[$app]:-0}" -v b="$gpu_pct" 'BEGIN {printf "%.2f", a+b}')
+      app_gpu_count[$app]=$(( ${app_gpu_count[$app]:-0} + 1 ))
+    fi
+  done < "$process_rows"
+
+  for app in "${!app_cpu[@]}"; do
+    score=$(awk -v c="${app_cpu[$app]}" -v r="${app_ram[$app]}" 'BEGIN {printf "%.2f", c+r}')
+    gpu_pct="N/D"
+    if [[ -n "${app_gpu_count[$app]:-}" ]]; then
+      gpu_pct=$(awk -v n="${app_gpu[$app]}" 'BEGIN {if(n>100)n=100; printf "%d", int(n+0.5)}')
+    fi
+    rows+=("$score	$app	${app_cpu[$app]}	${app_ram[$app]}	$gpu_pct	${app_count[$app]}")
+  done
+
+  if ((${#rows[@]} == 0)); then
+    printf 'Nenhum processo de usuário detectado.\n'
+    return
+  fi
+  printf '%s\n' "${rows[@]}" | sort -t $'\t' -k1,1nr | head -n 5 | awk -F '\t' '
+    function clip(s,n) {return length(s)>n ? substr(s,1,n-1) "…" : s}
+    function rounded(n) {return int(n+0.5)}
+    {
+      gpu=($5=="N/D" ? "N/D" : $5 "%")
+      printf "%-10s  %5d%%  %5d%%  %6s\n",clip($2,10),rounded($3),rounded($4),gpu
+    }'
+}
+
 resolve_test_name() {
   local output started finished elapsed
   DNS_RESULT_IP=""; DNS_RESULT_MS=""
@@ -485,30 +733,23 @@ print_storage_summary() {
     printf 'Nenhum disco físico ou remoto relevante detectado.\n'
     return
   fi
-  printf '%-10s %4s %-8s %-11s %s\n' 'MONTAGEM' 'USO' 'OCUPAÇÃO' 'CAP/LIVRE' 'DISPOSITIVO'
+  printf '%-10s  %6s  %-8s %-11s %s\n' 'MONTAGEM' 'USO' 'OCUPAÇÃO' 'CAP/LIVRE' 'DISPOSITIVO'
   while read -r source type size used available use_pct mount; do
     [[ -n "${source:-}" ]] || continue
     pct="${use_pct%\%}"
     [[ "$pct" =~ ^[0-9]+$ ]] || continue
-    printf '%-10s %4s ' "$(clip "$mount" 10)" "$use_pct"
+    printf '%-10s  %6s  ' "$(clip "$mount" 10)" "$use_pct"
     storage_bar "$use_pct"
     printf '  %s/%s  %s (%s)\n' "$size" "$available" "$source" "$type"
   done <<< "$rows"
 }
 
 collect_network() {
-  local public_ip="" iface private_ip gateway primary_dns
+  local public_ip iface private_ip gateway primary_dns
   local -a requested_interfaces
-  if command -v curl >/dev/null 2>&1; then
-    public_ip=$(curl -4 -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)
-  elif command -v wget >/dev/null 2>&1; then
-    public_ip=$(wget -4 -qO- --timeout=3 https://api.ipify.org 2>/dev/null || true)
-  fi
-  [[ "$public_ip" =~ ^[0-9a-fA-F:.]+$ ]] || public_ip="indisponível/offline"
   primary_dns=$(detect_primary_dns)
   {
     printf '\n%s── REDE ──%s\n' "$BLUE" "$RESET"
-    printf 'PUBLIC IP  %s\n' "$public_ip"
     IFS=',' read -ra requested_interfaces <<< "$NETWORK_INTERFACES"
     for iface in "${requested_interfaces[@]}"; do
       iface="${iface#${iface%%[![:space:]]*}}"; iface="${iface%${iface##*[![:space:]]}}"
@@ -520,33 +761,44 @@ collect_network() {
         printf '%-10s interface inexistente\n' "$iface"; continue
       fi
       private_ip=$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk 'NR==1 {print $4}')
+      private_ip="${private_ip%%/*}"
       gateway=$(ip -4 route show default dev "$iface" 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
-      printf '%-10s IP %-18s GW %s\n' "$iface" "${private_ip:-sem IPv4}" "${gateway:-sem gateway}"
+      public_ip=$(curl -4 -fsS --connect-timeout 2 --max-time 4 \
+        --interface "if!$iface" https://api.ipify.org 2>/dev/null || true)
+      [[ "$public_ip" =~ ^[0-9a-fA-F:.]+$ ]] || public_ip='indisponível'
+      # Put the public address immediately after the gateway and avoid padding
+      # so the important fields survive the overview panel's narrow width.
+      printf '%s GW %s EXT %s IP %s\n' \
+        "$iface" "${gateway:-sem gateway}" "$public_ip" "${private_ip:-sem IPv4}"
     done
     printf 'DNS PRINCIPAL  %s\n' "$primary_dns"
   } > "$TMP_DIR/network"
 }
 
 collect_resources() {
-  local load mem_total mem_avail mem_used mem_pct swap_total swap_free swap_pct uptime_s top_snapshot
-  local cpu_temperature gpu_temperature fans
+  local load mem_total mem_avail mem_used mem_pct swap_total swap_free swap_used swap_pct uptime_s cpu_usage
+  local gpu_usage cpu_temperature gpu_temperature fans
   load=$(awk '{print $1" "$2" "$3}' /proc/loadavg)
   read -r mem_total mem_avail swap_total swap_free < <(awk '
     /MemTotal/ {mt=$2} /MemAvailable/ {ma=$2} /SwapTotal/ {st=$2} /SwapFree/ {sf=$2}
     END {print mt,ma,st,sf}' /proc/meminfo)
-  mem_used=$((mem_total-mem_avail)); mem_pct=$((mem_used*100/(mem_total?mem_total:1)))
-  swap_pct=$(((swap_total-swap_free)*100/(swap_total?swap_total:1)))
+  mem_used=$((mem_total-mem_avail)); mem_pct=$(((mem_used*100+mem_total/2)/(mem_total?mem_total:1)))
+  swap_used=$((swap_total-swap_free)); swap_pct=$(((swap_used*100+swap_total/2)/(swap_total?swap_total:1)))
   uptime_s=${SECONDS}; [[ -r /proc/uptime ]] && read -r uptime_s _ < /proc/uptime
   uptime_s=${uptime_s%.*}
-  top_snapshot=$(ps -eo pid=,user=,pcpu=,pmem=,comm= 2>/dev/null)
+  read_cpu_usage
+  cpu_usage="$CPU_USAGE"
+  gpu_usage=$(read_gpu_usage)
   cpu_temperature=$(detect_cpu_temperature)
   gpu_temperature=$(detect_gpu_temperature)
   fans=$(detect_fans)
   resolve_test_name
   {
     printf 'LOAD  %s    CPU cores: %s\n' "$load" "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo '?')"
-    printf 'RAM   %3d%% ' "$mem_pct"; bar "$mem_pct" 18; printf '  %d / %d MiB\n' "$((mem_used/1024))" "$((mem_total/1024))"
-    printf 'SWAP  %3d%% ' "$swap_pct"; bar "$swap_pct" 18; printf '  uptime %dd %02dh %02dm\n' "$((uptime_s/86400))" "$((uptime_s%86400/3600))" "$((uptime_s%3600/60))"
+    print_usage_bar CPU "$cpu_usage"
+    printf '%-5s %5d%%  ' RAM "$mem_pct"; bar "$mem_pct" 18; printf '  %d / %d MiB\n' "$((mem_used/1024))" "$((mem_total/1024))"
+    print_usage_bar GPU "$gpu_usage"
+    printf '%-5s %5d%%  ' SWAP "$swap_pct"; bar "$swap_pct" 18; printf '  uptime %dd %02dh %02dm\n' "$((uptime_s/86400))" "$((uptime_s%86400/3600))" "$((uptime_s%3600/60))"
     [[ -r "$TMP_DIR/network" ]] && sed -n '1,$p' "$TMP_DIR/network"
     if [[ -n "$DNS_RESULT_IP" ]]; then
       printf 'DNS TEST   %s●%s %s → %s' "$GREEN" "$RESET" "$DNS_TEST_HOST" "$DNS_RESULT_IP"
@@ -557,10 +809,9 @@ collect_resources() {
       [[ -n "$DNS_RESULT_MS" ]] && printf '  %s ms' "$DNS_RESULT_MS"
       printf '\n'
     fi
-    printf '\n%s── TOP 3 CPU + RAM ──%s\n' "$MAGENTA" "$RESET"
-    awk '
-      {score=$3+$4; printf "%s\t%-6s %-9s CPU %5s%% RAM %5s%% %s\n",score,$1,$2,$3,$4,$5}' |
-      sort -rn | head -n 3 | cut -f2-
+    printf '\n%s── TOP 5 APLICATIVOS: CPU / RAM / GPU ──%s\n' "$MAGENTA" "$RESET"
+    printf '%-10s  %6s  %6s  %6s\n' 'PROGRAMA' 'CPU%' 'RAM%' 'GPU%'
+    collect_top_processes
     printf '\n%s── USUÁRIOS ATIVOS / STATUS ──%s\n' "$CYAN" "$RESET"
     if [[ -s "$TMP_DIR/users" ]]; then
       tail -n +2 "$TMP_DIR/users"
@@ -579,7 +830,7 @@ collect_resources() {
     fi
     printf '\n%s── ARMAZENAMENTO / DF -H ──%s\n' "$BLUE" "$RESET"
     print_storage_summary
-  } <<< "$top_snapshot" > "$TMP_DIR/resources"
+  } > "$TMP_DIR/resources"
 }
 
 collect_connections() {
@@ -723,14 +974,20 @@ capture_tui_command() {
 }
 
 run_command_snapshot() {
-  local status
-  if command -v timeout >/dev/null 2>&1; then
-    timeout 5s bash -lc "$CUSTOM_COMMAND" 2>&1 | head -n 200
-    status=${PIPESTATUS[0]}
-  else
-    printf 'O utilitário timeout é necessário para executar comandos personalizados com segurança.\n'
-    return
-  fi
+  local status=0 output_file="$TMP_DIR/custom-command.out"
+  # Isolate the command in its own process group so cleanup can terminate the
+  # whole command tree, including children left behind by a shell command.
+  setsid bash -c '
+    timeout 5s bash -lc "$1" > "$2" 2>&1
+    status=$?
+    head -n 200 "$2"
+    exit "$status"
+  ' sentinel "$CUSTOM_COMMAND" "$output_file" &
+  ACTIVE_COMMAND_PID=$!
+  wait "$ACTIVE_COMMAND_PID" || status=$?
+  kill -TERM -- "-$ACTIVE_COMMAND_PID" >/dev/null 2>&1 || true
+  kill -KILL -- "-$ACTIVE_COMMAND_PID" >/dev/null 2>&1 || true
+  ACTIVE_COMMAND_PID=""
   ((status==0 || status==141)) && return
   if ((status==124)); then
     printf '\n[comando interrompido após 5 segundos]\n'
@@ -836,9 +1093,9 @@ render() {
   rows=$capacity
   ((MAX_ROWS>0 && MAX_ROWS<rows)) && rows=$MAX_ROWS
   ((rows<1)) && rows=1
-  # Give the machine overview four rows taken from services/persistence while
+  # Give the machine overview six rows taken from services/persistence while
   # preserving at least one content row in very small terminals.
-  row_shift=4; ((row_shift>=rows)) && row_shift=$((rows-1))
+  row_shift=6; ((row_shift>=rows)) && row_shift=$((rows-1))
   resource_rows=$((rows+row_shift)); persistence_rows=$((rows-row_shift))
   printf '\e[H\e[2J'
   printf '%s%s  ◈ SENTINEL // LIVE SYSTEM TELEMETRY%s  %s%s%s  refresh %ss  [Ctrl+C: sair]%s\n' \
@@ -898,7 +1155,9 @@ while ((STOPPED == 0)); do
   fi
   render
   if [[ ! -t 0 ]]; then
-    sleep "$REFRESH_SECONDS" & wait $! || true
+    sleep "$REFRESH_SECONDS" & ACTIVE_SLEEP_PID=$!
+    wait "$ACTIVE_SLEEP_PID" || true
+    ACTIVE_SLEEP_PID=""
     continue
   fi
   # Keep the interface responsive between collection cycles without polling.
